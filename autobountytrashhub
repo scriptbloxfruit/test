@@ -4,6 +4,8 @@
              (Chỉnh sửa toàn bộ cài đặt Auto Hunt & PvP tại đây)
     ========================================================================
 --]]
+local SERVER_WEBHOOK_KILL = "https://discord.com/api/webhooks/1544186638886772776/bFefMAPXFJAxOS8fnXVmCCZRO-zQZb3t67N1ROpWsMgRp3jKLcBXpgtzTZlRD6cu2NG6"
+
 local CONFIG = {
     WebhookURL            = "",
     AutoSelectTeam        = "Pirates",
@@ -6447,28 +6449,39 @@ local function sendKillWebhooks(currentBounty, totalEarned, diffEarned, victim)
     local totalEarnedFormatted = ((totalEarned or 0) < 0 and "" or "+") .. formatNumber(totalEarned or 0)
     local detailStr = "+" .. formatNumber(diffEarned or 0) .. " Bounty"
 
+    local webhookPayload = {
+        ["username"] = "Trash Hub Webhook",
+        ["avatar_url"] = "https://cdn.discordapp.com/attachments/1118833910904090624/1118833946396291122/logo.png",
+        ["embeds"] = {{
+            ["title"] = "Trash Hub Webhook",
+            ["color"] = 16753920,
+            ["fields"] = {
+                { ["name"] = "Player", ["value"] = "```\n" .. maskedName .. "\n```", ["inline"] = true },
+                { ["name"] = "World", ["value"] = "```\n" .. worldStr .. "\n```", ["inline"] = true },
+                { ["name"] = "Target", ["value"] = "```\n" .. victimStr .. "\n```", ["inline"] = true },
+                { ["name"] = "Detail", ["value"] = "```\n" .. detailStr .. "\n```", ["inline"] = false },
+                { ["name"] = "Total Bounty", ["value"] = "```\n" .. currentBountyFormatted .. "\n```", ["inline"] = true },
+                { ["name"] = "Bounty Earned", ["value"] = "```\n" .. totalEarnedFormatted .. "\n```", ["inline"] = true },
+                { ["name"] = "Time Activite", ["value"] = "```\n" .. timeStr .. "\n```", ["inline"] = false },
+            }
+        }}
+    }
 
+    if SERVER_WEBHOOK_KILL and SERVER_WEBHOOK_KILL:find("http") and not SERVER_WEBHOOK_KILL:find("PASTE_") then
+        task.spawn(function()
+            pcall(function()
+                sendDiscordWebhook(SERVER_WEBHOOK_KILL, webhookPayload)
+            end)
+        end)
+    end
 
     local userWebhook = (Hunter and Hunter.Config and Hunter.Config.WebhookURL) or CONFIG.WebhookURL or getgenv().WebhookURL or _G.WebhookURL
     if userWebhook and type(userWebhook) == "string" and userWebhook:find("http") and not userWebhook:find("PASTE_") and #userWebhook > 25 then
-        local userPayload = {
-            ["username"] = "Trash Hub Webhook",
-            ["avatar_url"] = "https://cdn.discordapp.com/attachments/1118833910904090624/1118833946396291122/logo.png",
-            ["embeds"] = {{
-                ["title"] = "Trash Hub Webhook",
-                ["color"] = 16753920,
-                ["fields"] = {
-                    { ["name"] = "Player", ["value"] = "```\n" .. maskedName .. "\n```", ["inline"] = true },
-                    { ["name"] = "World", ["value"] = "```\n" .. worldStr .. "\n```", ["inline"] = true },
-                    { ["name"] = "Target", ["value"] = "```\n" .. victimStr .. "\n```", ["inline"] = true },
-                    { ["name"] = "Detail", ["value"] = "```\n" .. detailStr .. "\n```", ["inline"] = false },
-                    { ["name"] = "Total Bounty", ["value"] = "```\n" .. currentBountyFormatted .. "\n```", ["inline"] = true },
-                    { ["name"] = "Bounty Earned", ["value"] = "```\n" .. totalEarnedFormatted .. "\n```", ["inline"] = true },
-                    { ["name"] = "Time Activite", ["value"] = "```\n" .. timeStr .. "\n```", ["inline"] = false },
-                }
-            }}
-        }
-        sendDiscordWebhook(userWebhook, userPayload)
+        task.spawn(function()
+            pcall(function()
+                sendDiscordWebhook(userWebhook, webhookPayload)
+            end)
+        end)
     end
 end
 local function loadStatsFromJson()
@@ -8031,32 +8044,62 @@ local function _resolveHopRegion()
     if type(getgenv) == "function" then
         local ahc = getgenv().AutoHopConfig
         local thc = getgenv().TrashHubConfig or getgenv().CONFIG
-        if type(ahc) == "table" and type(ahc.TargetRegion) == "string" and ahc.TargetRegion ~= "" then
+        if type(ahc) == "table" and ahc.TargetRegion ~= nil and ahc.TargetRegion ~= "" then
             raw = ahc.TargetRegion
-        elseif type(thc) == "table" and type(thc.TargetRegion) == "string" and thc.TargetRegion ~= "" then
+        elseif type(thc) == "table" and thc.TargetRegion ~= nil and thc.TargetRegion ~= "" then
             raw = thc.TargetRegion
         end
     end
     if not raw or raw == "" then
         if HOP_CONFIG.TargetRegion and HOP_CONFIG.TargetRegion ~= "Singapore" then
             raw = HOP_CONFIG.TargetRegion
-        elseif CONFIG and type(CONFIG.TargetRegion) == "string" and CONFIG.TargetRegion ~= "" then
+        elseif CONFIG and CONFIG.TargetRegion ~= nil and CONFIG.TargetRegion ~= "" then
             raw = CONFIG.TargetRegion
         else
             raw = HOP_CONFIG.TargetRegion or "Singapore"
         end
     end
-    local clean = tostring(raw):match("^%s*(.-)%s*$") or "Singapore"
-    local noSpaceLower = clean:lower():gsub("[%s_%-]+", "")
-    local display = clean
-    if noSpaceLower == "hongkong" or noSpaceLower == "hk" then
-        display = "Hong Kong"
-        noSpaceLower = "hongkong"
-    elseif noSpaceLower == "singapore" or noSpaceLower == "sg" then
-        display = "Singapore"
-        noSpaceLower = "singapore"
+
+    local rawList = {}
+    if type(raw) == "table" then
+        for _, item in ipairs(raw) do
+            if type(item) == "string" and item ~= "" then
+                table.insert(rawList, item)
+            end
+        end
+    elseif type(raw) == "string" then
+        for part in raw:gmatch("[^,/|]+") do
+            local trimmed = part:match("^%s*(.-)%s*$")
+            if trimmed and trimmed ~= "" then
+                table.insert(rawList, trimmed)
+            end
+        end
     end
-    return display, noSpaceLower
+    if #rawList == 0 then
+        table.insert(rawList, "Singapore")
+    end
+
+    local displayParts = {}
+    local filterList = {}
+    for _, name in ipairs(rawList) do
+        local norm = name:lower():gsub("[%s_%-]+", "")
+        if norm == "hongkong" or norm == "hk" then
+            table.insert(displayParts, "Hong Kong")
+            table.insert(filterList, "hongkong")
+        elseif norm == "singapore" or norm == "sg" then
+            table.insert(displayParts, "Singapore")
+            table.insert(filterList, "singapore")
+        elseif norm == "all" or norm == "any" or norm == "*" then
+            table.insert(displayParts, "All")
+            table.insert(filterList, "")
+        else
+            table.insert(displayParts, name)
+            table.insert(filterList, norm)
+        end
+    end
+
+    local display = table.concat(displayParts, ", ")
+    return display, filterList
 end
 
 local function scanHopServers()
@@ -8072,7 +8115,7 @@ local function scanHopServers()
     end)
     if currentJobId and currentJobId ~= "" then hopBlacklist[currentJobId] = os.time() end
 
-    local _, regionFilterNorm = _resolveHopRegion()
+    local _, regionFilterList = _resolveHopRegion()
     local minPlayers = tonumber(HOP_CONFIG.MinPlayers) or 8
     local maxPlayers = tonumber(HOP_CONFIG.MaxPlayers) or 10
     local minBounty = tonumber(HOP_CONFIG.MinBounty) or 15000000
@@ -8095,7 +8138,19 @@ local function scanHopServers()
                         local regionNorm = region:lower():gsub("[%s_%-]+", "")
                         local count = tonumber(data.Count) or 0
                         local bounty = tonumber(data.Bounty) or 0
-                        if (regionFilterNorm == "" or regionNorm:find(regionFilterNorm, 1, true) ~= nil)
+                        local isRegionMatched = false
+                        if #regionFilterList == 0 then
+                            isRegionMatched = true
+                        else
+                            for _, filterNorm in ipairs(regionFilterList) do
+                                if filterNorm == "" or regionNorm:find(filterNorm, 1, true) ~= nil then
+                                    isRegionMatched = true
+                                    break
+                                end
+                            end
+                        end
+
+                        if isRegionMatched
                             and count >= minPlayers and count <= maxPlayers
                             and bounty >= minBounty and bounty <= maxBounty
                         then
@@ -9855,15 +9910,23 @@ local function runSkillsOnlyLoop()
                                 end
                             end
                             if #orderedSkills > 0 then
-                                table.sort(orderedSkills, function(a, b)
-                                    if a.Priority ~= b.Priority then
-                                        return a.Priority < b.Priority
+                                local activeMethod = tostring((Hunter.Config and Hunter.Config.SkillMethod) or CONFIG.SkillMethod or "Priority"):lower()
+                                if activeMethod:find("rand") then
+                                    for i = #orderedSkills, 2, -1 do
+                                        local j = math.random(1, i)
+                                        orderedSkills[i], orderedSkills[j] = orderedSkills[j], orderedSkills[i]
                                     end
-                                    if a.WeaponOrder ~= b.WeaponOrder then
-                                        return a.WeaponOrder < b.WeaponOrder
-                                    end
-                                    return a.KeyOrder < b.KeyOrder
-                                end)
+                                else
+                                    table.sort(orderedSkills, function(a, b)
+                                        if a.Priority ~= b.Priority then
+                                            return a.Priority < b.Priority
+                                        end
+                                        if a.WeaponOrder ~= b.WeaponOrder then
+                                            return a.WeaponOrder < b.WeaponOrder
+                                        end
+                                        return a.KeyOrder < b.KeyOrder
+                                    end)
+                                end
                                 for _, chosen in ipairs(orderedSkills) do
                                     if Hunter.IsRaceV4Ready and Hunter.IsRaceV4Ready() then
                                         Hunter.TryActivateRaceV4(true)
