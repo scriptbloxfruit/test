@@ -234,7 +234,15 @@ local autoHopServer
 local FRUIT_ALIASES
 local isSkillHolding = false
 local unlockSkillState
-local isLocalPlayerInPortalDimension, inspectPlayer, isAlive
+local isLocalPlayerInPortalDimension, isPlayerInPortalVDimension, inspectPlayer, isAlive, isPositionInRealWorld
+isPositionInRealWorld = function(pos)
+    if not pos then return false end
+    return (pos.Magnitude <= 35000)
+        and (math.abs(pos.X) <= 35000)
+        and (math.abs(pos.Z) <= 35000)
+        and (pos.Y >= -300)
+        and (pos.Y <= 15000)
+end
 
 if CONFIG.BoostFPS then
     if getgenv()._TrashHub_BoostConnections then
@@ -2077,6 +2085,14 @@ Hunter.Kinematics = (function()
         dt = math.clamp(dt, 0, math.max(cfg.MaxDt, 0.001))
         local position, targetPosition = root.Position, (Hunter.PortalXTracker and state.player and Hunter.PortalXTracker.GetRealPosition(state.player)) or part.Position
         if not finiteVector(position) or not finiteVector(targetPosition) then self:Pause(); return nil end
+        local amInDimension = isLocalPlayerInPortalDimension()
+        if amInDimension then
+            local distToTarget = (targetPosition - position).Magnitude
+            if distToTarget > 2500 or (state.player and not isPlayerInPortalVDimension(state.player)) then
+                self:Pause()
+                return nil
+            end
+        end
         local distance = (targetPosition - position).Magnitude
         state.distance = distance
         if state.mode == "COMBAT" then
@@ -3087,7 +3103,301 @@ Hunter.PortalXTracker = (function()
     return PortalXTrackerModule
 end)()
 
-Hunter.KenCheck = nil
+Hunter.KenCheck = (function()
+    local ENV = (type(getgenv) == "function" and getgenv()) or _G
+    if ENV._TrashHub_KenCheck and type(ENV._TrashHub_KenCheck.Destroy) == "function" then
+        pcall(ENV._TrashHub_KenCheck.Destroy)
+    end
+
+    local Players = game:GetService("Players")
+    local CollectionService = game:GetService("CollectionService")
+
+    local KenCheckModule = {}
+    KenCheckModule.__index = KenCheckModule
+
+    local _connections = {}
+    local _dodgeListeners = {}
+
+    local function resolveTarget(target)
+        if not target or (typeof(target) ~= "Instance" and type(target) ~= "table" and type(target) ~= "userdata") or type(target.IsA) ~= "function" then
+            return nil, nil
+        end
+        if target:IsA("Player") then
+            return target, target.Character
+        elseif target:IsA("Model") then
+            return Players:GetPlayerFromCharacter(target), target
+        elseif target:IsA("BasePart") or target:IsA("Humanoid") then
+            local model = target:FindFirstAncestorOfClass("Model")
+            if model then
+                return Players:GetPlayerFromCharacter(model), model
+            end
+        end
+        return nil, nil
+    end
+
+    local function getServerTime()
+        local ok, t = pcall(function() return workspace:GetServerTimeNow() end)
+        if ok and type(t) == "number" then
+            return t
+        end
+        return os.time()
+    end
+
+    function KenCheckModule.IsKenActive(target): boolean
+        local player = resolveTarget(target)
+        if not player then
+            return false
+        end
+        local ok, active = pcall(function() return player:GetAttribute("KenActive") end)
+        return (ok and active == true) or false
+    end
+
+    function KenCheckModule.GetDodgesLeft(target): number
+        local player = resolveTarget(target)
+        if not player then
+            return 0
+        end
+        local ok, attr = pcall(function() return player:GetAttribute("KenDodgesLeft") end)
+        if ok and attr ~= nil then
+            local dodges = tonumber(attr)
+            if dodges then
+                return math.max(0, dodges)
+            end
+        end
+        return 0
+    end
+
+    function KenCheckModule.GetMaxDodges(target): number
+        local player = resolveTarget(target)
+        if not player then
+            return 0
+        end
+        local ok, attr = pcall(function() return player:GetAttribute("KenMaxDodges") end)
+        if ok and attr ~= nil then
+            return tonumber(attr) or 0
+        end
+        return 0
+    end
+
+    function KenCheckModule.IsKenDisabled(target): boolean
+        local _, char = resolveTarget(target)
+        if not char then
+            return false
+        end
+        local ok, child = pcall(function() return char:FindFirstChild("KenDisabled") end)
+        return (ok and child ~= nil) or false
+    end
+
+    function KenCheckModule.CanDodge(target, minDodgeCost: number?): boolean
+        local player, char = resolveTarget(target)
+        if not player or not char then
+            return false
+        end
+        if KenCheckModule.IsKenActive(player) ~= true then
+            return false
+        end
+        if KenCheckModule.IsKenDisabled(char) then
+            return false
+        end
+        local dodgesLeft = KenCheckModule.GetDodgesLeft(player)
+        local threshold = minDodgeCost or 0.5
+        return dodgesLeft >= threshold
+    end
+
+    function KenCheckModule.ShouldUseKenBreak(target): boolean
+        return KenCheckModule.CanDodge(target, 0.5)
+    end
+
+    function KenCheckModule.DidJustDodge(target, windowSeconds: number?): boolean
+        local player = resolveTarget(target)
+        if not player then
+            return false
+        end
+        local ok, attr = pcall(function() return player:GetAttribute("LastKenDodge") end)
+        if not ok or not attr then
+            return false
+        end
+        local lastDodge = tonumber(attr)
+        if not lastDodge or lastDodge <= 0 then
+            return false
+        end
+        local elapsed = getServerTime() - lastDodge
+        return elapsed >= 0 and elapsed <= (windowSeconds or 0.45)
+    end
+
+    function KenCheckModule.GetKenTier(target): (boolean, boolean, number)
+        local player, char = resolveTarget(target)
+        local targetInst = char or (target and target:IsA("Instance") and target)
+        if not targetInst then
+            return false, false, 0
+        end
+        local hasV1 = false
+        local hasV2 = false
+        pcall(function()
+            hasV1 = CollectionService:HasTag(targetInst, "Ken") or (char and CollectionService:HasTag(char, "Ken")) or (player and CollectionService:HasTag(player, "Ken")) or false
+            hasV2 = CollectionService:HasTag(targetInst, "KenUpgrade") or (char and CollectionService:HasTag(char, "KenUpgrade")) or (player and CollectionService:HasTag(player, "KenUpgrade")) or false
+        end)
+        local tier = hasV2 and 2 or (hasV1 and 1 or 0)
+        return hasV1, hasV2, tier
+    end
+
+    function KenCheckModule.GetStatus(target)
+        local player, char = resolveTarget(target)
+        if not player then
+            return {
+                Valid = false,
+                Active = false,
+                KenActive = false,
+                DodgesLeft = 0,
+                KenDodgesLeft = 0,
+                MaxDodges = 0,
+                KenDisabled = false,
+                CanDodge = false,
+                ShouldKenBreak = false,
+                JustDodged = false,
+                Tier = 0,
+                HasV1 = false,
+                HasV2 = false,
+                LastDodgeTime = 0,
+                TimeSinceLastDodge = math.huge,
+            }
+        end
+
+        local active = KenCheckModule.IsKenActive(player)
+        local dodgesLeft = KenCheckModule.GetDodgesLeft(player)
+        local maxDodges = KenCheckModule.GetMaxDodges(player)
+        local kenDisabled = (char and KenCheckModule.IsKenDisabled(char)) or false
+        local canDodge = active and (not kenDisabled) and (dodgesLeft >= 0.5)
+        local lastDodge = 0
+        pcall(function()
+            lastDodge = tonumber(player:GetAttribute("LastKenDodge")) or 0
+        end)
+        local timeSince = (lastDodge > 0) and math.max(0, getServerTime() - lastDodge) or math.huge
+        local hasV1, hasV2, tier = KenCheckModule.GetKenTier(char or player)
+
+        return {
+            Valid = true,
+            Player = player,
+            Character = char,
+            Active = active,
+            KenActive = active,
+            DodgesLeft = dodgesLeft,
+            KenDodgesLeft = dodgesLeft,
+            MaxDodges = maxDodges,
+            KenDisabled = kenDisabled,
+            CanDodge = canDodge,
+            ShouldKenBreak = canDodge,
+            JustDodged = timeSince <= 0.45,
+            Tier = tier,
+            HasV1 = hasV1,
+            HasV2 = hasV2,
+            LastDodgeTime = lastDodge,
+            TimeSinceLastDodge = timeSince,
+        }
+    end
+
+    function KenCheckModule.WatchTarget(target, callback: (any, string) -> ())
+        local player = resolveTarget(target)
+        if not player or type(callback) ~= "function" then
+            return function() end
+        end
+
+        local watchConns = {}
+        local charConns = {}
+
+        local function cleanupConnections(list)
+            for _, c in ipairs(list) do
+                if c and c.Connected then
+                    c:Disconnect()
+                end
+                local idx = table.find(_connections, c)
+                if idx then
+                    table.remove(_connections, idx)
+                end
+            end
+            table.clear(list)
+        end
+
+        local function disconnectAll()
+            cleanupConnections(charConns)
+            cleanupConnections(watchConns)
+        end
+
+        local function fire(eventType)
+            callback(KenCheckModule.GetStatus(player), eventType)
+        end
+
+        local function trackWatch(conn)
+            table.insert(watchConns, conn)
+            table.insert(_connections, conn)
+            return conn
+        end
+
+        local function trackChar(conn)
+            table.insert(charConns, conn)
+            table.insert(_connections, conn)
+            return conn
+        end
+
+        trackWatch(player:GetAttributeChangedSignal("KenActive"):Connect(function()
+            fire("KenActiveChanged")
+        end))
+
+        trackWatch(player:GetAttributeChangedSignal("KenDodgesLeft"):Connect(function()
+            fire("DodgesLeftChanged")
+        end))
+
+        trackWatch(player:GetAttributeChangedSignal("LastKenDodge"):Connect(function()
+            fire("TargetDodged")
+        end))
+
+        local function hookChar(char)
+            cleanupConnections(charConns)
+            if not char then
+                return
+            end
+            trackChar(char.ChildAdded:Connect(function(child)
+                if child.Name == "KenDisabled" then
+                    fire("KenBroken")
+                end
+            end))
+            trackChar(char.ChildRemoved:Connect(function(child)
+                if child.Name == "KenDisabled" then
+                    fire("KenBreakRecovered")
+                end
+            end))
+        end
+
+        if player.Character then
+            hookChar(player.Character)
+        end
+        trackWatch(player.CharacterAdded:Connect(hookChar))
+        trackWatch(Players.PlayerRemoving:Connect(function(plr)
+            if plr == player then
+                disconnectAll()
+            end
+        end))
+
+        return disconnectAll
+    end
+
+    function KenCheckModule.Destroy()
+        for _, conn in ipairs(_connections) do
+            if conn and conn.Connected then
+                conn:Disconnect()
+            end
+        end
+        table.clear(_connections)
+        table.clear(_dodgeListeners)
+        if ENV._TrashHub_KenCheck == KenCheckModule then
+            ENV._TrashHub_KenCheck = nil
+        end
+    end
+
+    ENV._TrashHub_KenCheck = KenCheckModule
+    ENV.KenCheckModule = KenCheckModule
+    return KenCheckModule
+end)()
 
 local _permanentKilledByBlacklist = {}
 local _killedTargets = {}
@@ -6096,12 +6406,46 @@ isLocalPlayerInPortalDimension = function()
     local ok, res = pcall(function()
         local char = LocalPlayer.Character
         if not char then return false end
-        if char:GetAttribute("PortaledToAnotherDimension") == true then return true end
-        local root = char:FindFirstChild("HumanoidRootPart")
-        if root and (root:GetAttribute("PortaledToAnotherDimension") == true or root.Position.Y < -300) then
+        local root = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+        if not root then return false end
+        if char:GetAttribute("PortaledToAnotherDimension") == true
+            or root:GetAttribute("PortaledToAnotherDimension") == true
+            or LocalPlayer:GetAttribute("PortaledToAnotherDimension") == true
+            or root.Position.Y < -300
+            or not isPositionInRealWorld(root.Position) then
             return true
         end
-        if LocalPlayer:GetAttribute("PortaledToAnotherDimension") == true then return true end
+        return false
+    end)
+    return ok and res or false
+end
+
+isPlayerInPortalVDimension = function(player)
+    if not player then return false end
+    if player == LocalPlayer then
+        return isLocalPlayerInPortalDimension()
+    end
+    local ok, res = pcall(function()
+        local char = player.Character
+        if not char then return false end
+        local root = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+        if not root then return false end
+
+        local myInDim = isLocalPlayerInPortalDimension()
+        local _, _, myRoot = getCharacter()
+        local distFromMe = myRoot and (root.Position - myRoot.Position).Magnitude or math.huge
+
+        if myInDim then
+            return distFromMe <= 2500
+        end
+
+        if char:GetAttribute("PortaledToAnotherDimension") == true
+            or root:GetAttribute("PortaledToAnotherDimension") == true
+            or player:GetAttribute("PortaledToAnotherDimension") == true
+            or root.Position.Y < -300
+            or not isPositionInRealWorld(root.Position) then
+            return true
+        end
         return false
     end)
     return ok and res or false
@@ -7096,7 +7440,6 @@ end
 
 local function isTargetInPortalVDimension(player)
     if not player then return false end
-    if isLocalPlayerInPortalDimension() then return false end
     if Hunter.PortalXTracker and Hunter.PortalXTracker.IsInPortalX(player) then
         return false
     end
@@ -7111,11 +7454,24 @@ local function isTargetInPortalVDimension(player)
         if Hunter.PortalXTracker and Hunter.PortalXTracker.IsSpoofedPosition(pos) then
             return false
         end
-        local dist = myRoot and (pos - myRoot.Position).Magnitude or 0
 
-        if dist > 50000 or pos.Magnitude > 70000 or pos.Y < -500 or pos.Y > 15000 then
+        local amInDimension = isLocalPlayerInPortalDimension()
+        if amInDimension then
+            return false
+        end
+
+        local targetInRealWorld = isPositionInRealWorld(pos)
+        local dist = myRoot and (pos - myRoot.Position).Magnitude or 0
+        if dist > 35000 or not targetInRealWorld then
             return true
         end
+
+        local inDimAttr = (char:GetAttribute("PortaledToAnotherDimension") == true)
+            or (root:GetAttribute("PortaledToAnotherDimension") == true)
+            or (player:GetAttribute("PortaledToAnotherDimension") == true)
+            or (char:GetAttribute("InPortalDimension") == true)
+            or (root:GetAttribute("InPortalDimension") == true)
+            or (player:GetAttribute("InPortalDimension") == true)
 
         if player == Hunter.TargetPlayer then
             local now = tick()
@@ -7142,22 +7498,15 @@ local function isTargetInPortalVDimension(player)
             local recentlyCastPortalV = (vAnimTick and (now - vAnimTick) <= 18.0)
                 or (vTpTick and (now - vTpTick) <= 18.0)
 
-            local inDimAttr = (char:GetAttribute("PortaledToAnotherDimension") == true)
-                or (root:GetAttribute("PortaledToAnotherDimension") == true)
-                or (player:GetAttribute("PortaledToAnotherDimension") == true)
-
             if recentlyCastPortalV then
                 local movedFromCast = vCastPos and ((pos - vCastPos).Magnitude > 5000) or false
-                if inDimAttr or (movedFromCast and (dist > 25000 or pos.Magnitude > 45000)) then
+                if inDimAttr or (movedFromCast and (dist > 25000 or not targetInRealWorld)) then
                     return true
                 end
             end
         end
 
-        local inDimAny = (char:GetAttribute("PortaledToAnotherDimension") == true)
-            or (root:GetAttribute("PortaledToAnotherDimension") == true)
-            or (player:GetAttribute("PortaledToAnotherDimension") == true)
-        if inDimAny and dist > 5000 then
+        if inDimAttr and dist > 5000 then
             return true
         end
 
@@ -7351,9 +7700,9 @@ inspectPlayer = function(player, isCurrentTarget)
     if Hunter.KenCheck then
         local kenSt = Hunter.KenCheck.GetStatus(player)
         if kenSt then
-            result.KenActive = kenSt.KenActive
-            result.KenDodgesLeft = kenSt.KenDodgesLeft
-            result.KenDisabled = kenSt.KenDisabled
+            result.KenActive = (kenSt.KenActive ~= nil and kenSt.KenActive) or kenSt.Active or false
+            result.KenDodgesLeft = kenSt.KenDodgesLeft or kenSt.DodgesLeft or 0
+            result.KenDisabled = kenSt.KenDisabled or false
         end
     end
     local _, _, myRoot = getCharacter()
@@ -7361,11 +7710,22 @@ inspectPlayer = function(player, isCurrentTarget)
         result.Distance = math.floor((realPos - myRoot.Position).Magnitude)
     end
 
-    if isLocalPlayerInPortalDimension() then
-        result.CanPvP = true
-        result.StatusText = "[V DIMENSION]"
-        result.StatusColor = Color3.fromRGB(180, 0, 255)
-        return result
+    local amInDimension = isLocalPlayerInPortalDimension()
+    if amInDimension then
+        local distFromMe = result.Distance or math.huge
+        local inPortalDim = isPlayerInPortalVDimension(player)
+        if not inPortalDim or distFromMe > 2500 then
+            result.CanPvP = false
+            result.Reason = "TargetOutsidePortalDimension"
+            result.StatusText = string.format("[OUTSIDE V PORTAL (%dm) -> SKIPPED]", math.floor(distFromMe))
+            result.StatusColor = Color3.fromRGB(180, 80, 255)
+            return result
+        else
+            result.CanPvP = true
+            result.StatusText = "[V DIMENSION TARGET]"
+            result.StatusColor = Color3.fromRGB(180, 0, 255)
+            return result
+        end
     end
 
     if isTargetInPortalVDimension(player) then
@@ -7540,13 +7900,25 @@ local function findTarget()
 
     local bestPlayer
     local lockedPlayer = Hunter.TargetPlayer
+    local amInDimension = isLocalPlayerInPortalDimension()
     if lockedPlayer and lockedPlayer.Parent then
         local liveChar = lockedPlayer.Character
         local liveHum = liveChar and liveChar:FindFirstChildOfClass("Humanoid")
         local liveRoot = liveChar and (liveChar:FindFirstChild("HumanoidRootPart") or liveChar.PrimaryPart)
         local tName = lockedPlayer.Name
 
-        if not isTargetEligible(tName) then
+        if amInDimension then
+            local lPos = (liveRoot and ((Hunter.PortalXTracker and Hunter.PortalXTracker.GetRealPosition(lockedPlayer)) or liveRoot.Position))
+            local distToLocked = (lPos and myRoot) and (lPos - myRoot.Position).Magnitude or math.huge
+            if not isPlayerInPortalVDimension(lockedPlayer) or distToLocked > 2500 or not lPos then
+                skipCurrentTarget()
+                lockedPlayer = nil
+            end
+        end
+
+        if not lockedPlayer then
+            -- dropped cross-dimension target
+        elseif not isTargetEligible(tName) then
             Hunter.TargetPlayer = nil
             Hunter.TargetCharacter = nil
             Hunter.TargetPart = nil
@@ -7750,10 +8122,16 @@ local function findTarget()
 
     local bestDist = math.huge
     local bestHealth = math.huge
+    local bestScore = -math.huge
     bestPlayer = nil
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LocalPlayer and p.Character and isAlive(p.Character) then
             local pName = p.Name
+            if amInDimension and isPlayerInPortalVDimension(p) then
+                _skippedTargets[pName] = nil
+                _killedTargets[pName] = nil
+                _permanentKilledByBlacklist[pName] = nil
+            end
             if isTargetEligible(pName) then
                 local info = inspectPlayer(p, false)
                 if info.CanPvP then
@@ -7763,10 +8141,19 @@ local function findTarget()
                         local rPos = (Hunter.PortalXTracker and Hunter.PortalXTracker.GetRealPosition(p)) or r.Position
                         local d = (rPos - myRoot.Position).Magnitude
                         local hp = humanoid.Health
-                        if hp < bestHealth or (hp == bestHealth and d < bestDist) then
-                            bestHealth = hp
-                            bestDist = d
-                            bestPlayer = p
+
+                        if amInDimension then
+                            local score = 1000000 + (2500 - math.min(d, 2500)) - (hp * 0.01)
+                            if score > bestScore then
+                                bestScore = score
+                                bestPlayer = p
+                            end
+                        else
+                            if hp < bestHealth or (hp == bestHealth and d < bestDist) then
+                                bestHealth = hp
+                                bestDist = d
+                                bestPlayer = p
+                            end
                         end
                     end
                 end
@@ -7799,7 +8186,7 @@ local function findTarget()
 
     local actCfg = getActiveConfig()
     local hopIfNoPvP = (actCfg.HopIfNoPvPPlayers ~= false)
-    if not bestPlayer and hopIfNoPvP then
+    if not bestPlayer and hopIfNoPvP and not amInDimension then
         if _postKillTransitionPending then
             _postKillTransitionPending = false
             if type(autoHopServer) == "function" then
@@ -9316,85 +9703,174 @@ table.insert(Hunter._connections, getgenv()._TrashHub_SpawnCombatConn)
 end
 do
 local _lastKenToggleTick = 0
+local _isPressingKen = false
+local _isKenActive = false
 
 local function isObservationHakiActive(char)
-    if not char then return false end
-    if char:GetAttribute("KenActive") == true or char:GetAttribute("Observation") == true or char:GetAttribute("ObservationHaki") == true then
-        return true
-    end
-    if _G.OM and type(_G.OM.active) == "boolean" then
-        return _G.OM.active
-    end
-    local events = ReplicatedStorage:FindFirstChild("Events")
-    if events and events:FindFirstChild("IsObservationActive") then
-        local ok, active = pcall(function() return events.IsObservationActive:Invoke() end)
+    local target = char or LocalPlayer
+    if Hunter.KenCheck and type(Hunter.KenCheck.IsKenActive) == "function" then
+        local ok, active = pcall(Hunter.KenCheck.IsKenActive, target)
         if ok and type(active) == "boolean" then
             return active
         end
     end
-    local pgui = LocalPlayer:FindFirstChild("PlayerGui")
-    if pgui then
-        local obsGui = pgui:FindFirstChild("Observation") or pgui:FindFirstChild("ObservationV2") or pgui:FindFirstChild("KenHaki")
-        if obsGui and obsGui.Enabled then
-            return true
-        end
+    local targetPlr = (target:IsA("Player") and target) or Players:GetPlayerFromCharacter(target) or LocalPlayer
+    local ok, attr = pcall(function() return targetPlr:GetAttribute("KenActive") end)
+    if ok and type(attr) == "boolean" then
+        return attr
     end
-    return false
+    return _isKenActive == true
 end
 
 local function isObservationHakiOnCooldown(char)
-    if not char then return true end
-    if char:FindFirstChild("KenDisabled") then
-        return true
+    local targetChar = (char and (char:IsA("Player") and char.Character or char)) or LocalPlayer.Character
+    if not targetChar then return true end
+    if Hunter.KenCheck and type(Hunter.KenCheck.IsKenDisabled) == "function" then
+        local ok, disabled = pcall(Hunter.KenCheck.IsKenDisabled, targetChar)
+        if ok and type(disabled) == "boolean" then
+            return disabled
+        end
     end
+    local ok, disabled = pcall(function() return targetChar:FindFirstChild("KenDisabled") ~= nil end)
+    if ok then return disabled end
     return false
 end
 
+local function playerHasObservationHaki(char)
+    local targetChar = (char and (char:IsA("Player") and char.Character or char)) or LocalPlayer.Character
+    if not targetChar then return false end
+    if Hunter.KenCheck and type(Hunter.KenCheck.GetKenTier) == "function" then
+        local ok, hasV1, hasV2 = pcall(Hunter.KenCheck.GetKenTier, targetChar)
+        if ok and (hasV1 or hasV2) then
+            return true
+        end
+    end
+    local ok1, hasV1 = pcall(function() return CollectionService:HasTag(targetChar, "Ken") end)
+    local ok2, hasV2 = pcall(function() return CollectionService:HasTag(targetChar, "KenUpgrade") end)
+    return (ok1 and hasV1 == true) or (ok2 and hasV2 == true) or false
+end
+
 local function triggerEnableObservation(char)
+    char = char or LocalPlayer.Character
     if not char then return end
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then return end
 
+    if not playerHasObservationHaki(char) then return end
+    if isObservationHakiActive(char) then return end
+    if isObservationHakiOnCooldown(char) then return end
+
     local now = tick()
-    if now - _lastKenToggleTick < 0.4 then return end
-    if isObservationHakiActive(char) or isObservationHakiOnCooldown(char) then return end
-    _lastKenToggleTick = now
+    if now - _lastKenToggleTick < 1.2 then return end
+    if _isPressingKen then return end
 
-    pcall(function()
-        local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-        local commE = remotes and remotes:FindFirstChild("CommE")
-        if commE then
-            commE:FireServer("Ken", true)
-        end
-    end)
+    task.spawn(function()
+        if _isPressingKen then return end
+        _isPressingKen = true
 
-    task.delay(0.12, function()
-        local curChar = LocalPlayer.Character
-        if curChar == char and not isObservationHakiActive(curChar) and not isObservationHakiOnCooldown(curChar) then
+        pcall(function()
+            local curChar = LocalPlayer.Character
+            if curChar ~= char then return end
+            local curHum = curChar:FindFirstChildOfClass("Humanoid")
+            if not curHum or curHum.Health <= 0 then return end
+
+            -- Re-verify all safety constraints immediately before sending key down
+            if not playerHasObservationHaki(curChar) then return end
+            if isObservationHakiActive(curChar) then return end
+            if isObservationHakiOnCooldown(curChar) then return end
+
+            _lastKenToggleTick = tick()
+
             pcall(function()
                 VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-                task.wait(0.02)
+            end)
+            task.wait(0.05)
+            pcall(function()
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
             end)
-        end
+        end)
+
+        _isPressingKen = false
     end)
 end
 Hunter.TriggerEnableObservation = triggerEnableObservation
 
 local function setupKenListener(char)
     if not char then return end
+
+    -- 1. KenDisabled ChildRemoved Listener
     if getgenv()._TrashHub_KenChildConn then
         pcall(function() getgenv()._TrashHub_KenChildConn:Disconnect() end)
+        if Hunter._connections then
+            local idx = table.find(Hunter._connections, getgenv()._TrashHub_KenChildConn)
+            if idx then table.remove(Hunter._connections, idx) end
+        end
         getgenv()._TrashHub_KenChildConn = nil
     end
+
     getgenv()._TrashHub_KenChildConn = char.ChildRemoved:Connect(function(child)
         if child.Name == "KenDisabled" then
             task.wait(0.1)
-            triggerEnableObservation(char)
+            local curChar = LocalPlayer.Character
+            if curChar and curChar == char
+                and playerHasObservationHaki(curChar)
+                and not isObservationHakiActive(curChar)
+                and not isObservationHakiOnCooldown(curChar)
+            then
+                triggerEnableObservation(curChar)
+            end
         end
     end)
+    if Hunter._connections then
+        table.insert(Hunter._connections, getgenv()._TrashHub_KenChildConn)
+    end
+
+    -- 2. KenActive AttributeChanged Listener (keeps internal state synced)
+    if getgenv()._TrashHub_KenAttrConn then
+        pcall(function() getgenv()._TrashHub_KenAttrConn:Disconnect() end)
+        if Hunter._connections then
+            local idx = table.find(Hunter._connections, getgenv()._TrashHub_KenAttrConn)
+            if idx then table.remove(Hunter._connections, idx) end
+        end
+        getgenv()._TrashHub_KenAttrConn = nil
+    end
+
+    _isKenActive = LocalPlayer:GetAttribute("KenActive") == true
+    getgenv()._TrashHub_KenAttrConn = LocalPlayer:GetAttributeChangedSignal("KenActive"):Connect(function()
+        local active = LocalPlayer:GetAttribute("KenActive") == true
+        _isKenActive = active
+        if active then
+            _lastKenToggleTick = tick()
+        else
+            local curChar = LocalPlayer.Character
+            if curChar and curChar == char
+                and playerHasObservationHaki(curChar)
+                and not isObservationHakiActive(curChar)
+                and not isObservationHakiOnCooldown(curChar)
+            then
+                task.delay(0.2, function()
+                    local c = LocalPlayer.Character
+                    if c and c == char
+                        and playerHasObservationHaki(c)
+                        and not isObservationHakiActive(c)
+                        and not isObservationHakiOnCooldown(c)
+                    then
+                        triggerEnableObservation(c)
+                    end
+                end)
+            end
+        end
+    end)
+    if Hunter._connections then
+        table.insert(Hunter._connections, getgenv()._TrashHub_KenAttrConn)
+    end
+
+    -- 3. Reset toggle timestamp on spawn and auto-enable after short delay
+    _lastKenToggleTick = 0
     task.delay(0.6, function()
-        triggerEnableObservation(char)
+        if LocalPlayer.Character == char then
+            triggerEnableObservation(char)
+        end
     end)
 end
 
@@ -9403,10 +9879,18 @@ if LocalPlayer.Character then
 end
 if getgenv()._TrashHub_KenCharConn then
     pcall(function() getgenv()._TrashHub_KenCharConn:Disconnect() end)
+    if Hunter._connections then
+        local idx = table.find(Hunter._connections, getgenv()._TrashHub_KenCharConn)
+        if idx then table.remove(Hunter._connections, idx) end
+    end
+    getgenv()._TrashHub_KenCharConn = nil
 end
 getgenv()._TrashHub_KenCharConn = LocalPlayer.CharacterAdded:Connect(function(newChar)
     task.spawn(setupKenListener, newChar)
 end)
+if Hunter._connections then
+    table.insert(Hunter._connections, getgenv()._TrashHub_KenCharConn)
+end
 end
 
 do
@@ -11989,8 +12473,12 @@ local function _mainLoopStep(dt)
             end
         end
         if Hunter._isHealingInSky then
-            Hunter.Kinematics:Pause()
-            return
+            if isLocalPlayerInPortalDimension() then
+                releaseLowHealthEscape("in portal dimension")
+            else
+                Hunter.Kinematics:Pause()
+                return
+            end
         end
         if _isPortalWarping then
             Hunter.Kinematics:Pause()
@@ -12001,6 +12489,22 @@ local function _mainLoopStep(dt)
             end
             return
         end
+
+        local myChar, myHum, myRoot = getCharacter()
+        local amInDimension = isLocalPlayerInPortalDimension()
+
+        if amInDimension and Hunter.TargetPlayer then
+            local curP = Hunter.TargetPlayer
+            local cChar = curP.Character
+            local cRoot = cChar and (cChar:FindFirstChild("HumanoidRootPart") or cChar.PrimaryPart)
+            local cPos = cRoot and ((Hunter.PortalXTracker and Hunter.PortalXTracker.GetRealPosition(curP)) or cRoot.Position)
+            local distToCur = (cPos and myRoot) and (cPos - myRoot.Position).Magnitude or math.huge
+            if not isPlayerInPortalVDimension(curP) or distToCur > 2500 or not cPos then
+                skipCurrentTarget()
+                _lastFindTargetTime = 0
+            end
+        end
+
         local tChar, tPart = findTarget()
         local isTargetPortalX = Hunter.TargetPlayer ~= nil and isTargetUsingPortalDimension(Hunter.TargetPlayer)
         if isTargetPortalX and (not tChar or not tPart or not isAlive(tChar)) then
@@ -12323,7 +12827,7 @@ local function _mainLoopStep(dt)
         local minPortalDist = _portalGetMinDistance()
         local portalDist = _portalGetLiveTargetDistance(Hunter.TargetPlayer) or distToTarget
         local deferPortalForSea3Gate = (Hunter.Sea3TeleporterRoute and Hunter.Sea3TeleporterRoute:ShouldDeferPortalC(myRoot.Position))
-        if _portalIsEnabled() and not _isPortalWarping and not deferPortalForSea3Gate and portalDist >= minPortalDist then
+        if not amInDimension and _portalIsEnabled() and not _isPortalWarping and not deferPortalForSea3Gate and portalDist >= minPortalDist then
             local canPortal, _ = _portalCanUse()
             if canPortal then
                 _portalExecuteSmartWarp(Hunter.TargetPlayer, tPos)
@@ -12337,7 +12841,7 @@ local function _mainLoopStep(dt)
             end
         end
 
-        if Hunter.Sea3TeleporterRoute and not Hunter.GhostShipRoute.Busy
+        if not amInDimension and Hunter.Sea3TeleporterRoute and not Hunter.GhostShipRoute.Busy
             and Hunter.Sea3TeleporterRoute:Step(dt, myRoot, myHum, tPos, Hunter.TargetPlayer) then
             Hunter.Kinematics:Pause()
             setHover(true)
@@ -12345,7 +12849,7 @@ local function _mainLoopStep(dt)
             return
         end
 
-        if Hunter.GhostShipRoute:Step(dt, myRoot, myHum, tPos, Hunter.TargetPlayer) then
+        if not amInDimension and Hunter.GhostShipRoute:Step(dt, myRoot, myHum, tPos, Hunter.TargetPlayer) then
             if Hunter.Sea3TeleporterRoute and Hunter.Sea3TeleporterRoute.Busy then
                 Hunter.Sea3TeleporterRoute:Reset("ghostship-started")
             end
@@ -12370,6 +12874,13 @@ local function _mainLoopStep(dt)
             runSkillsOnlyLoop()
             return
         end
+        if amInDimension then
+            if distToTarget > 2500 or (Hunter.TargetPlayer and not isPlayerInPortalVDimension(Hunter.TargetPlayer)) then
+                Hunter.Kinematics:Pause()
+                return
+            end
+        end
+
         setHover(true)
         if isPortalX and realTargetCF then
             local goalPos = realTargetCF.Position + Vector3.new(0, 12, 0)
@@ -13046,6 +13557,7 @@ function Hunter.Destroy()
     Hunter._isRunning = false
     if Hunter.M1GunAim then pcall(Hunter.M1GunAim.Destroy, Hunter.M1GunAim) end
     if Hunter.PortalXTracker then pcall(Hunter.PortalXTracker.Destroy) end
+    if Hunter.KenCheck and type(Hunter.KenCheck.Destroy) == "function" then pcall(Hunter.KenCheck.Destroy) end
         if Hunter.SkillCheck then pcall(Hunter.SkillCheck.ClearCache) end
     if Hunter.SkillDodge then pcall(Hunter.SkillDodge.Destroy, Hunter.SkillDodge) end
     if Hunter.WaterWalker then pcall(Hunter.WaterWalker.Destroy, Hunter.WaterWalker) end
@@ -13108,7 +13620,7 @@ function Hunter.Destroy()
     for _, connName in ipairs({
         "_TrashHub_SoundMuteConn", "_TrashHub_CleanMapConn", "_TrashHub_SeatConn",
         "_TrashHub_MainCharConn", "_TrashHub_KenCharConn", "_TrashHub_SpawnCombatConn", "_TrashHubNoclipConn",
-        "_TrashHub_KenChildConn", "_TrashHub_NotifConn", "_TrashHub_EscapeConn",
+        "_TrashHub_KenChildConn", "_TrashHub_KenAttrConn", "_TrashHub_NotifConn", "_TrashHub_EscapeConn",
         "_TrashHub_CameraConn", "_TrashHub_DiedConn", "_TrashHub_ZeroDelayConn",
         "_TrashHub_LowHpHeartbeat", "_TrashHub_V4EnergyConn", "_TrashHub_V4ChildConn",
         "_TrashHub_V4CharConn"
