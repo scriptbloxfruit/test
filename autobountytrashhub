@@ -1388,8 +1388,6 @@ Hunter.StunCheck = (function()
             return cached.inGhZ, cached.reason
         end
 
-        local inGodhumanWindow = Hunter and Hunter._godhumanLockUntil and (now < Hunter._godhumanLockUntil)
-
         local hum = character:FindFirstChildOfClass("Humanoid")
         local animator = hum and hum:FindFirstChildOfClass("Animator")
         if animator then
@@ -1416,8 +1414,8 @@ Hunter.StunCheck = (function()
         end
 
         local equippedTool = character:FindFirstChildOfClass("Tool")
-        local isGodhumanEquipped = equippedTool and (equippedTool.Name == "Godhuman" or equippedTool.ToolTip == "Melee")
-        if isGodhumanEquipped or inGodhumanWindow then
+        local isGodhumanEquipped = equippedTool and equippedTool.Name == "Godhuman"
+        if isGodhumanEquipped then
             local head = character:FindFirstChild("Head")
             local lowerTorso = character:FindFirstChild("LowerTorso") or character:FindFirstChild("Torso")
             if (head and head:IsA("BasePart") and head.Transparency >= 0.95)
@@ -1425,11 +1423,6 @@ Hunter.StunCheck = (function()
                 _godhumanZCache[character] = { inGhZ = true, reason = "GodhumanZInvisibleBarrage", at = now }
                 return true, "GodhumanZInvisibleBarrage"
             end
-        end
-
-        if inGodhumanWindow then
-            _godhumanZCache[character] = { inGhZ = true, reason = "GodhumanCastWindow", at = now }
-            return true, "GodhumanCastWindow"
         end
 
         _godhumanZCache[character] = { inGhZ = false, reason = nil, at = now }
@@ -1656,11 +1649,6 @@ Hunter.StunCheck = (function()
             return true, "DeadOrMissingParts", nil
         end
 
-        local inGhZ, ghZReason = StunCheck.IsInGodhumanZ(character)
-        if inGhZ then
-            return true, ghZReason, { GodhumanGrab = ghZReason }
-        end
-
         local stunValObj = character:FindFirstChild("Stun")
         local stunVal = (stunValObj and tonumber(stunValObj.Value)) or 0
         if stunVal > 0 then
@@ -1713,11 +1701,6 @@ Hunter.StunCheck = (function()
             return false, "NoCharacter"
         end
 
-        local inGhZ, ghZReason = StunCheck.IsInGodhumanZ(char)
-        if inGhZ then
-            return false, "LockedByGodhuman:" .. tostring(ghZReason)
-        end
-
         local isStunned, stunReason = StunCheck.IsStunned(char, ignoreBusy)
         if isStunned then
             return false, "Stunned:" .. tostring(stunReason)
@@ -1762,11 +1745,6 @@ Hunter.StunCheck = (function()
             return false, "NoCharacter"
         end
 
-        local inGhZ, ghZReason = StunCheck.IsInGodhumanZ(char)
-        if inGhZ then
-            return false, ghZReason
-        end
-
         local isStunned, stunReason = StunCheck.IsStunned(char, true)
         if isStunned then
             return false, stunReason
@@ -1790,10 +1768,6 @@ Hunter.IsActionLocked = function(character)
     if not character then return true, "NoCharacter" end
 
     if Hunter.StunCheck then
-        local inGhZ, ghZReason = Hunter.StunCheck.IsInGodhumanZ(character)
-        if inGhZ then
-            return true, "Godhuman:" .. tostring(ghZReason)
-        end
         if Hunter.StunCheck.IsServerPhysicsLocked then
             local physLocked, physReason = Hunter.StunCheck.IsServerPhysicsLocked(character)
             if physLocked then
@@ -4806,287 +4780,479 @@ end
 
 end
 do
-    local _fastSkill = {
-        initialized = false,
-        hookInstalled = false,
-        ownsHook = false,
-        oldIndex = nil,
-        globalModule = nil,
-        castGuardFunction = nil,
-        castGuardIndex = nil,
-        maintenanceToken = 0,
-        maintenanceActive = false,
-        watchConnections = {},
-        watchedObjects = setmetatable({}, {__mode = "k"}),
-        watchedCharacter = nil,
-    }
-
-    local function _fs_isCharacterLocked(character)
-        character = character or LocalPlayer.Character
-        if not character then return true end
-        local hk = getgenv()._BF_HunterKiller or Hunter
-        if hk and hk.IsActionLocked then
-            return hk.IsActionLocked(character)
-        end
-        return false
+    local previous = getgenv().__FastSkill
+    if previous then
+        if type(previous.Destroy) == "function" then pcall(previous.Destroy)
+        elseif type(previous.StopMaintenance) == "function" then pcall(previous.StopMaintenance) end
     end
+    Hunter.FastSkill = (function()
+-- FastSkill.lua
+-- Module độc lập cho bypass trạng thái Busy/Stun và khóa cast nội bộ.
+-- Module này không tự khởi chạy; caller phải gọi FastSkill.Init().
 
-    local _castGuardSearchRunning = false
-    local function _fs_findCastGuardUpvalueAsync()
-        if _fastSkill.castGuardFunction and _fastSkill.castGuardIndex then return true end
-        local cached = getgenv()._TrashHub_CachedCastGuard
-        if type(cached) == "table" and type(cached.fn) == "function" and type(cached.idx) == "number" then
-            _fastSkill.castGuardFunction = cached.fn
-            _fastSkill.castGuardIndex = cached.idx
-            return true
-        end
-        if _castGuardSearchRunning then return false end
-        if type(getgc) ~= "function" or type(debug) ~= "table"
-            or type(debug.getupvalues) ~= "function" or type(debug.setupvalue) ~= "function"
-            or type(debug.getinfo) ~= "function" then
-            return false
-        end
-        _castGuardSearchRunning = true
-        task.spawn(function()
-            task.wait(2.5)
-            local okList, list = pcall(getgc, false)
-            if okList and type(list) == "table" then
-                local sliceStart = os.clock()
-                for i = 1, #list do
-                    local obj = list[i]
-                    if type(obj) == "function" then
-                        local okInfo, info = pcall(debug.getinfo, obj)
-                        local src = okInfo and info and tostring(info.short_src or info.source or "") or ""
-                        if src:find("MovesetClientRunner", 1, true) then
-                            local okUp, upvalues = pcall(debug.getupvalues, obj)
-                            if okUp and type(upvalues) == "table" then
-                                local hasGlobalRef = false
-                                local boolIndex = nil
-                                for idx, val in pairs(upvalues) do
-                                    if val == _fastSkill.globalModule then
-                                        hasGlobalRef = true
-                                    elseif type(val) == "boolean" then
-                                        boolIndex = idx
-                                    end
-                                end
-                                if hasGlobalRef and boolIndex then
-                                    _fastSkill.castGuardFunction = obj
-                                    _fastSkill.castGuardIndex = boolIndex
-                                    getgenv()._TrashHub_CachedCastGuard = { fn = obj, idx = boolIndex }
-                                    break
-                                end
-                            end
-                        end
-                    end
-                    if os.clock() - sliceStart > 0.001 then
-                        task.wait()
-                        sliceStart = os.clock()
-                    end
-                end
-            end
-            _castGuardSearchRunning = false
-        end)
-        return false
+local FastSkill = {}
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+local state = {
+    initialized = false,
+    destroyed = false,
+    watchGeneration = 0,
+    lifecycleConnections = {},
+    hookInstalled = false,
+    ownsHook = false,
+    oldIndex = nil,
+    globalModule = nil,
+    castGuardFunction = nil,
+    castGuardIndex = nil,
+    maintenanceToken = 0,
+    maintenanceActive = false,
+    lastHookReason = nil,
+    maskedReads = {
+        Busy = 0,
+        Stun = 0,
+        Holding = 0,
+    },
+    lastMaskedAt = 0,
+    diagnosticsEnabled = false,
+    watchConnections = {},
+    watchedObjects = setmetatable({}, {__mode = "k"}),
+    watchedCharacter = nil,
+}
+
+local function getEnv()
+    if type(getgenv) == "function" then
+        return getgenv()
     end
+    return _G
+end
 
-    local function _fs_resetCastGuard()
-        if not _fastSkill.castGuardFunction or not _fastSkill.castGuardIndex then
-            _fs_findCastGuardUpvalueAsync()
-            return false
-        end
-        local ok = pcall(debug.setupvalue, _fastSkill.castGuardFunction, _fastSkill.castGuardIndex, false)
-        return ok
-    end
+local function readUpvalue(fn, index)
+    local ok, first, second = pcall(debug.getupvalue, fn, index)
+    if not ok then return nil end
+    if type(first) == "string" and second ~= nil then return second end
+    return first
+end
 
-    local function _fs_resetGlobalState()
-        if not _fastSkill.globalModule then return false end
-        if _fs_isCharacterLocked(LocalPlayer.Character) then return false end
-        _fastSkill.globalModule.busy = false
-        _fastSkill.globalModule.castTimer = 0
-        _fastSkill.globalModule.equipTimer = 0
-        _fastSkill.globalModule.tapCooldown = 0
-        _fastSkill.globalModule.fruitSwapTimeLockout = 0
-        _fastSkill.globalModule.Swimming = false
+local function clearValue(object)
+    if not object then return false end
+
+    if object:IsA("BoolValue") then
+        if object.Value then object.Value = false end
+        return true
+    elseif object:IsA("NumberValue") or object:IsA("IntValue") then
+        if object.Value ~= 0 then object.Value = 0 end
         return true
     end
 
-    local function _fs_init()
-        if _fastSkill.initialized then return true end
-        pcall(function()
-            local gModule = ReplicatedStorage:FindFirstChild("Global")
-            if gModule then
-                _fastSkill.globalModule = require(gModule)
-            else
-                task.defer(function()
-                    pcall(function()
-                        local gm = ReplicatedStorage:FindFirstChild("Global") or ReplicatedStorage:WaitForChild("Global", 1.0)
-                        if gm then
-                            _fastSkill.globalModule = require(gm)
-                            _fs_findCastGuardUpvalueAsync()
-                        end
-                    end)
-                end)
-            end
-        end)
-        _fs_findCastGuardUpvalueAsync()
-        pcall(function()
-            local prev = getgenv().__FastSkill
-            local prevState = prev and type(prev.GetState) == "function" and prev.GetState()
-            if prevState and prevState.hookInstalled and prevState.oldIndex and type(hookmetamethod) == "function" then
-                pcall(function()
-                    hookmetamethod(game, "__index", prevState.oldIndex)
-                end)
-            end
-            _fastSkill.oldIndex = nil
-            _fastSkill.hookInstalled = false
-            _fastSkill.ownsHook = false
-        end)
-        _fastSkill.initialized = true
+    return false
+end
+
+local function clearAttribute(character, name)
+    local value = character:GetAttribute(name)
+    if type(value) == "boolean" then
+        character:SetAttribute(name, false)
+        return true
+    elseif type(value) == "number" then
+        character:SetAttribute(name, 0)
         return true
     end
+    return false
+end
 
-    local function _fs_bypass()
-        pcall(function()
-            local character = LocalPlayer.Character
-            if not character then return end
-            if _fs_isCharacterLocked(character) then return end
-            local hk = getgenv()._BF_HunterKiller or Hunter
-            local busy = character:FindFirstChild("Busy")
-            if busy and (busy:IsA("BoolValue") or busy:IsA("ValueBase")) then
-                busy.Value = false
-            end
-            if not (hk and hk._skillHeldKey) then
-                for _, child in ipairs(character:GetChildren()) do
-                    if child:IsA("Tool") then
-                        local holding = child:FindFirstChild("Holding")
-                        if holding and holding:IsA("BoolValue") then
-                            holding.Value = false
-                        end
-                    end
-                end
-            end
-            _fs_resetGlobalState()
-            _fs_resetCastGuard()
-        end)
+local function resetGlobalState()
+    if state.destroyed or type(state.globalModule) ~= "table" then return false end
+    state.globalModule.busy = false
+    state.globalModule.castTimer = 0
+    state.globalModule.tapCooldown = 0
+    state.globalModule.fruitSwapTimeLockout = 0
+    return true
+end
+
+local function resolveCastGuard()
+    if type(debug) ~= "table"
+        or type(debug.getupvalue) ~= "function"
+        or type(debug.setupvalue) ~= "function" then
+        return nil, nil
     end
 
-    local function _fs_disconnectWatchers()
-        for _, conn in ipairs(_fastSkill.watchConnections) do
-            pcall(function() conn:Disconnect() end)
-        end
-        _fastSkill.watchConnections = {}
-        _fastSkill.watchedObjects = setmetatable({}, {__mode = "k"})
-        _fastSkill.watchedCharacter = nil
+    local casFunc = state.globalModule and rawget(state.globalModule, "casFunc")
+    if type(casFunc) ~= "function" then
+        return nil, nil
     end
 
-    local function _fs_trackConn(conn)
-        table.insert(_fastSkill.watchConnections, conn)
-        return conn
+    -- MovesetClientRunner.casFunc giữ khóa re-entry trong upvalue 13.
+    -- Xác thực thêm Parent Tool và Holding để tránh ghi nhầm nếu game đổi layout closure.
+    local parent = readUpvalue(casFunc, 2)
+    local guard = readUpvalue(casFunc, 13)
+    local holding = readUpvalue(casFunc, 15)
+    if typeof(parent) ~= "Instance" or not parent:IsA("Tool") then
+        return nil, nil
+    end
+    if type(guard) ~= "boolean" then
+        return nil, nil
+    end
+    if typeof(holding) ~= "Instance" or holding.Name ~= "Holding" then
+        return nil, nil
     end
 
-    local function _fs_watchBusy(busyObj, character)
-        if not busyObj or _fastSkill.watchedObjects[busyObj] then return end
-        _fastSkill.watchedObjects[busyObj] = true
-        if busyObj.Value == true and not _fs_isCharacterLocked(character) then
-            busyObj.Value = false
-        end
-        _fs_trackConn(busyObj.Changed:Connect(function(val)
-            if val == true and not _fs_isCharacterLocked(character) then
-                busyObj.Value = false
-            end
-        end))
+    state.castGuardFunction = casFunc
+    state.castGuardIndex = 13
+    return casFunc, 13
+end
+
+local function resetCastGuard()
+    local casFunc = state.globalModule and rawget(state.globalModule, "casFunc")
+    local guardIndex = state.castGuardIndex
+
+    if casFunc ~= state.castGuardFunction or not guardIndex then
+        casFunc, guardIndex = resolveCastGuard()
+    end
+    if not casFunc or not guardIndex then return false end
+
+    local guard = readUpvalue(casFunc, guardIndex)
+    if type(guard) ~= "boolean" then
+        state.castGuardFunction = nil
+        state.castGuardIndex = nil
+        return false
     end
 
-    local function _fs_watchTool(tool, character)
-        if not tool or not tool:IsA("Tool") or _fastSkill.watchedObjects[tool] then return end
-        _fastSkill.watchedObjects[tool] = true
-        local function bindHolding(holding)
-            if not holding or not holding:IsA("BoolValue") or _fastSkill.watchedObjects[holding] then return end
-            _fastSkill.watchedObjects[holding] = true
-            _fs_trackConn(holding.Changed:Connect(function(val)
-                local hk = getgenv()._BF_HunterKiller or Hunter
-                if val == true and not (hk and hk._skillHeldKey) and not _fs_isCharacterLocked(character) then
-                    holding.Value = false
-                end
-            end))
-        end
-        bindHolding(tool:FindFirstChild("Holding"))
-        _fs_trackConn(tool.ChildAdded:Connect(function(child)
-            if child.Name == "Holding" then bindHolding(child) end
-        end))
+    if guard then
+        local ok = pcall(debug.setupvalue, casFunc, guardIndex, false)
+        if not ok then return false end
     end
+    return true
+end
 
-    local function _fs_attachWatchers(character)
-        _fs_disconnectWatchers()
-        if not character then return end
-        _fastSkill.watchedCharacter = character
-
-        local busy = character:FindFirstChild("Busy")
-        if busy then _fs_watchBusy(busy, character) end
-        for _, child in ipairs(character:GetChildren()) do
-            if child:IsA("Tool") then _fs_watchTool(child, character) end
-        end
-
-        _fs_trackConn(character.ChildAdded:Connect(function(child)
-            if child.Name == "Busy" then
-                _fs_watchBusy(child, character)
-            elseif child:IsA("Tool") then
-                _fs_watchTool(child, character)
-                if not _fs_isCharacterLocked(character) then
-                    _fs_resetGlobalState()
-                end
-            end
-        end))
-
-        _fs_trackConn(RunService.Heartbeat:Connect(function()
-            if character.Parent == nil then return end
-            if not _fs_isCharacterLocked(character) then
-                local b = character:FindFirstChild("Busy")
-                if b and b.Value == true then b.Value = false end
-                _fs_resetGlobalState()
-            end
-        end))
-
-        _fs_bypass()
+local function resetAbilityState(forceCastGuard)
+    local globalReset = resetGlobalState()
+    local castGuardReset = false
+    if forceCastGuard == true then
+        castGuardReset = resetCastGuard()
     end
+    return globalReset, castGuardReset
+end
 
-    local function _fs_startMaintenance(isRunningFn)
-        _fastSkill.maintenanceToken = _fastSkill.maintenanceToken + 1
-        local token = _fastSkill.maintenanceToken
-        _fastSkill.maintenanceActive = true
-        task.spawn(function()
-            while token == _fastSkill.maintenanceToken do
-                if isRunningFn and not isRunningFn() then break end
+local function isStatusObject(object, statusName)
+    if not object or object.Name ~= statusName then return false end
+    return object:IsA("BoolValue")
+        or object:IsA("NumberValue")
+        or object:IsA("IntValue")
+end
+
+function FastSkill.InstallIndexHook()
+    if state.destroyed then return false, "destroyed" end
+    if state.hookInstalled then return true, "already-installed" end
+    if type(hookmetamethod) ~= "function" then return false, "hookmetamethod-unavailable" end
+    if type(newcclosure) ~= "function" then return false, "newcclosure-unavailable" end
+
+    local env = getEnv()
+    local registry = env.__TrashHubFastSkillHook_v2
+    if type(registry) ~= "table" or registry.Game ~= game or type(registry.Original) ~= "function" then
+        registry = {Game = game}
+        local oldIndex
+        oldIndex = hookmetamethod(game, "__index", newcclosure(function(object, key)
+            local owner = registry.Owner
+            if owner and not owner.destroyed and owner.hookInstalled and key == "Value"
+                and type(checkcaller) == "function" and not checkcaller()
+                and typeof(object) == "Instance" then
                 local character = LocalPlayer.Character
-                if character ~= _fastSkill.watchedCharacter then
-                    _fs_attachWatchers(character)
+                if character and object:IsDescendantOf(character)
+                    and (isStatusObject(object, "Busy") or isStatusObject(object, "Stun")) then
+                    if owner.diagnosticsEnabled then
+                        owner.maskedReads[object.Name] = (owner.maskedReads[object.Name] or 0) + 1
+                        owner.lastMaskedAt = tick()
+                    end
+                    if object:IsA("BoolValue") then return false end
+                    return 0
                 end
-                task.wait(0.25)
             end
-            if token == _fastSkill.maintenanceToken then
-                _fastSkill.maintenanceActive = false
-                _fs_disconnectWatchers()
-            end
-        end)
+            return oldIndex(object, key)
+        end))
+        registry.Original = oldIndex
+        env.__TrashHubFastSkillHook_v2 = registry
+    end
+    registry.Owner = state
+    state.hookRegistry = registry
+    state.oldIndex = registry.Original
+    state.hookInstalled, state.ownsHook = true, true
+    return true, "installed"
+end
+
+function FastSkill.UninstallIndexHook()
+    -- Leave the dispatcher in the chain so later aim/physics hooks stay intact.
+    local registry = state.hookRegistry
+    if registry and registry.Owner == state then registry.Owner = nil end
+    state.oldIndex, state.hookRegistry = nil, nil
+    state.hookInstalled, state.ownsHook, state.initialized = false, false, false
+    state.lastHookReason = "deactivated"
+    return true, "deactivated"
+end
+
+function FastSkill.Init()
+    if state.destroyed then return false, "destroyed" end
+    if state.initialized then return true end
+
+    pcall(function()
+        local requireModule = require
+        local globalScript = ReplicatedStorage:WaitForChild("Global", 2)
+        if globalScript then
+            local result = requireModule(globalScript)
+            if type(result) == "table" then state.globalModule = result end
+        end
+    end)
+
+    local hookOk, hookReason = FastSkill.InstallIndexHook()
+    state.lastHookReason = hookReason
+    if not hookOk then
+        return false, hookReason
     end
 
-    local function _fs_stopMaintenance()
-        _fastSkill.maintenanceToken = _fastSkill.maintenanceToken + 1
-        _fastSkill.maintenanceActive = false
-        _fs_disconnectWatchers()
-    end
+    state.initialized = true
+    return true, hookReason
+end
 
-    getgenv().__FastSkill = {
-        Init = _fs_init,
-        Bypass = _fs_bypass,
-        ResetCastGuard = _fs_resetCastGuard,
-        StartMaintenance = _fs_startMaintenance,
-        StopMaintenance = _fs_stopMaintenance,
-        GetState = function() return _fastSkill end,
+function FastSkill.Bypass(getCharacterFn, options)
+    options = type(options) == "table" and options or {}
+    local report = {
+        characterFound = false,
+        valuesCleared = 0,
+        attributesCleared = 0,
+        animationsStopped = 0,
+        globalReset = false,
+        castGuardReset = false,
     }
 
-    _fs_init()
-    _fs_startMaintenance(function() return Hunter._isRunning end)
+    if state.destroyed then report.ok = false; return report end
+    local ok = pcall(function()
+        report.globalReset, report.castGuardReset = resetAbilityState(options.forceCastGuard == true)
+
+        local character = getCharacterFn and getCharacterFn() or LocalPlayer.Character
+        if not character then return end
+        report.characterFound = true
+
+        for _, object in ipairs(character:GetDescendants()) do
+            if object.Name == "Stun" or object.Name == "Busy" or (object.Name == "Holding" and not options.preserveHolding) then
+                if clearValue(object) then
+                    report.valuesCleared = report.valuesCleared + 1
+                end
+            end
+        end
+
+        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+        if backpack and not options.preserveHolding then
+            for _, object in ipairs(backpack:GetDescendants()) do
+                if object.Name == "Holding" and clearValue(object) then
+                    report.valuesCleared = report.valuesCleared + 1
+                end
+            end
+        end
+
+        for _, name in ipairs({"Stun", "Busy", "Cooldown", "Stunned"}) do
+            if clearAttribute(character, name) then
+                report.attributesCleared = report.attributesCleared + 1
+            end
+        end
+
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+        if animator then
+            for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                local animation = track.Animation
+                local name = animation and animation.Name:lower() or ""
+                if name:find("stun", 1, true)
+                    or name:find("dazed", 1, true)
+                    or name:find("knockback", 1, true)
+                    or name:find("hurt", 1, true) then
+                    track:Stop(0)
+                    report.animationsStopped = report.animationsStopped + 1
+                end
+            end
+        end
+    end)
+
+    report.ok = ok
+    return report
+end
+
+local function disconnect(list)
+    for _, connection in pairs(list) do pcall(function() connection:Disconnect() end) end
+    table.clear(list)
+end
+
+local function disconnectWatchers()
+    state.watchGeneration = state.watchGeneration + 1
+    disconnect(state.watchConnections)
+    disconnect(state.watchedObjects)
+    state.watchedCharacter = nil
+end
+
+local function trackConnection(connection)
+    table.insert(state.watchConnections, connection)
+    return connection
+end
+
+local function currentWatch(character, generation)
+    return character ~= nil and not state.destroyed and state.maintenanceActive and generation == state.watchGeneration
+        and state.watchedCharacter == character and LocalPlayer.Character == character
+end
+
+local function watchStatusObject(object)
+    local character, generation = state.watchedCharacter, state.watchGeneration
+    if not currentWatch(character, generation) or not object:IsDescendantOf(character)
+        or state.watchedObjects[object] or (object.Name ~= "Stun" and object.Name ~= "Busy") then return end
+    if not clearValue(object) then return end
+    state.watchedObjects[object] = object:GetPropertyChangedSignal("Value"):Connect(function()
+        if currentWatch(character, generation) and object:IsDescendantOf(character) then clearValue(object) end
+    end)
+end
+
+local function attachWatchers(character, getCharacterFn)
+    disconnectWatchers()
+    if not character or state.destroyed or not state.maintenanceActive then return end
+    state.watchedCharacter = character
+    local generation = state.watchGeneration
+    for _, object in ipairs(character:GetDescendants()) do watchStatusObject(object) end
+    trackConnection(character.DescendantAdded:Connect(watchStatusObject))
+    trackConnection(character.DescendantRemoving:Connect(function(object)
+        local connection = state.watchedObjects[object]
+        if connection then connection:Disconnect(); state.watchedObjects[object] = nil end
+    end))
+    for _, name in ipairs({"Stun", "Busy", "Cooldown", "Stunned"}) do
+        clearAttribute(character, name)
+        trackConnection(character:GetAttributeChangedSignal(name):Connect(function()
+            if currentWatch(character, generation) then clearAttribute(character, name) end
+        end))
+    end
+    trackConnection(RunService.Heartbeat:Connect(function()
+        if currentWatch(character, generation) then resetGlobalState() end
+    end))
+    -- Maintenance never clears Holding between key-down and key-up.
+    FastSkill.Bypass(getCharacterFn, {preserveHolding = true})
+end
+
+function FastSkill.StartMaintenance(getCharacterFn, isRunningFn, interval)
+    if state.destroyed then return nil, "destroyed" end
+    FastSkill.StopMaintenance()
+    interval = math.max(0.25, tonumber(interval) or 0.5)
+    state.maintenanceToken = state.maintenanceToken + 1
+    local token = state.maintenanceToken
+    state.maintenanceActive = true
+    local function running()
+        return token == state.maintenanceToken and not state.destroyed
+            and (not isRunningFn or isRunningFn())
+    end
+    local function refresh()
+        if not running() then return end
+        local character = getCharacterFn and getCharacterFn() or LocalPlayer.Character
+        if character == state.retiringCharacter then character = nil end
+        if character ~= state.watchedCharacter then attachWatchers(character, getCharacterFn) end
+    end
+    table.insert(state.lifecycleConnections, LocalPlayer.CharacterAdded:Connect(function(character)
+        if not running() or character ~= LocalPlayer.Character then return end
+        state.retiringCharacter = nil
+        refresh()
+    end))
+    table.insert(state.lifecycleConnections, LocalPlayer.CharacterRemoving:Connect(function(character)
+        if token == state.maintenanceToken and character == state.watchedCharacter then
+            state.retiringCharacter = character
+            disconnectWatchers()
+        end
+    end))
+    refresh()
+    task.spawn(function()
+        while running() do refresh(); task.wait(interval) end
+        if token == state.maintenanceToken then FastSkill.StopMaintenance() end
+    end)
+    return token
+end
+
+function FastSkill.StopMaintenance()
+    state.maintenanceToken = state.maintenanceToken + 1
+    state.maintenanceActive = false
+    disconnectWatchers()
+    disconnect(state.lifecycleConnections)
+end
+
+function FastSkill.IsCastBusy()
+    local casFunc = state.globalModule and rawget(state.globalModule, "casFunc")
+    local guardIndex = state.castGuardIndex
+    if casFunc ~= state.castGuardFunction or not guardIndex then
+        casFunc, guardIndex = resolveCastGuard()
+    end
+    if not casFunc or not guardIndex then return nil end
+    local guard = readUpvalue(casFunc, guardIndex)
+    if type(guard) == "boolean" then return guard end
+    return nil
+end
+
+function FastSkill.WaitForCastReady(timeout)
+    local deadline = tick() + math.max(0, tonumber(timeout) or 0.8)
+    repeat
+        local busy = FastSkill.IsCastBusy()
+        if busy == false then return true end
+        task.wait()
+    until tick() >= deadline
+    return FastSkill.IsCastBusy() == false
+end
+
+function FastSkill.ReleaseCastGuard()
+    -- Chỉ gọi cho cặp skill đã test server-side tương thích (hiện tại: Buddy X/Z).
+    return resetCastGuard()
+end
+
+function FastSkill.GetState()
+    return {
+        initialized = state.initialized,
+        hookInstalled = state.hookInstalled,
+        ownsHook = state.ownsHook,
+        lastHookReason = state.lastHookReason,
+        castGuardResolved = state.castGuardFunction ~= nil and state.castGuardIndex ~= nil,
+        maintenanceRunning = state.maintenanceActive,
+        diagnosticsEnabled = state.diagnosticsEnabled,
+        watchedCharacter = state.watchedCharacter and state.watchedCharacter.Name or nil,
+        maskedReads = {
+            Busy = state.maskedReads.Busy,
+            Stun = state.maskedReads.Stun,
+            Holding = state.maskedReads.Holding,
+        },
+        lastMaskedAt = state.lastMaskedAt,
+    }
+end
+
+function FastSkill.ResetDiagnostics()
+    state.maskedReads.Busy = 0
+    state.maskedReads.Stun = 0
+    state.maskedReads.Holding = 0
+    state.lastMaskedAt = 0
+end
+
+function FastSkill.EnableDiagnostics(enabled)
+    state.diagnosticsEnabled = enabled == true
+    if not state.diagnosticsEnabled then
+        FastSkill.ResetDiagnostics()
+    end
+    return state.diagnosticsEnabled
+end
+
+function FastSkill.Destroy()
+    state.destroyed = true
+    FastSkill.StopMaintenance()
+    local ok, reason = FastSkill.UninstallIndexHook()
+    state.retiringCharacter, state.globalModule = nil, nil
+    state.castGuardFunction, state.castGuardIndex = nil, nil
+    return ok, reason
+end
+
+return FastSkill
+    end)()
+    getgenv().__FastSkill = Hunter.FastSkill
+    local ok, initialized, reason = pcall(Hunter.FastSkill.Init)
+    Hunter._fastSkillInit = {Ready = ok and initialized == true, Reason = ok and reason or tostring(initialized)}
+    Hunter.FastSkill.StartMaintenance(getCharacter, function() return Hunter._isRunning end, 0.25)
 end
 
 local function setupPlayerDeathListener(char)
@@ -9934,48 +10100,12 @@ local function getToolByType(toolType)
     end
     return nil
 end
-local _cachedGlobalModule = nil
 unlockSkillState = function()
-    local char = LocalPlayer.Character
-    if not char then return end
-    if Hunter and Hunter.IsActionLocked and Hunter.IsActionLocked(char) then
-        return
-    end
-    pcall(function()
-        local busy = char:FindFirstChild("Busy")
-        if busy and (busy:IsA("BoolValue") or busy:IsA("ValueBase")) then
-            busy.Value = false
-        end
-        if not (Hunter and Hunter._skillHeldKey) then
-            for _, child in ipairs(char:GetChildren()) do
-                if child:IsA("Tool") then
-                    local holding = child:FindFirstChild("Holding")
-                    if holding and holding:IsA("BoolValue") then
-                        holding.Value = false
-                    end
-                end
-            end
-        end
-    end)
-    pcall(function()
-        if getgenv().__FastSkill and getgenv().__FastSkill.Bypass then
-            getgenv().__FastSkill.Bypass()
-        end
-    end)
-    pcall(function()
-        if not _cachedGlobalModule then
-            local gm = ReplicatedStorage:FindFirstChild("Global")
-            if gm then _cachedGlobalModule = require(gm) end
-        end
-        if _cachedGlobalModule then
-            _cachedGlobalModule.busy = false
-            _cachedGlobalModule.castTimer = 0
-            _cachedGlobalModule.equipTimer = 0
-            _cachedGlobalModule.tapCooldown = 0
-            _cachedGlobalModule.fruitSwapTimeLockout = 0
-            _cachedGlobalModule.Swimming = false
-        end
-    end)
+    if not Hunter._isRunning or not LocalPlayer.Character then return end
+    local module = Hunter.FastSkill
+    if not module or type(module.Bypass) ~= "function" then return end
+    local ok, report = pcall(module.Bypass, getCharacter, {preserveHolding = Hunter._skillHeldKey ~= nil})
+    if not ok then Hunter._fastSkillError = tostring(report) end
 end
 
 local function waitUntilSkillAnimationDone(maxWaitSeconds)
@@ -10327,7 +10457,6 @@ local function castSkillTap(key, holdDuration, count, countInterval, weaponName,
     if Hunter.SkillDodge and Hunter.SkillDodge:IsEnemySkillDodging() then return false end
     if Hunter.IsActionLocked and Hunter.IsActionLocked(LocalPlayer.Character) then return false end
     unlockSkillState()
-    local isGodhumanSkill = (weaponName == "Melee" and (keyName == "Z" or keyName == "C"))
     local spamCount = math.clamp(math.floor(tonumber(count) or 2), 1, 3)
     local spamInterval = math.max(tonumber(countInterval) or 0.035, 0.035)
     local keyHold = math.max(tonumber(holdDuration) or 0, 0.04)
@@ -10360,8 +10489,7 @@ local function castSkillTap(key, holdDuration, count, countInterval, weaponName,
                 local preCheck = Hunter.ReadSkillState(castTool, keyName)
                 local stampMid = LocalPlayer.Character and LocalPlayer.Character:GetAttribute(cooldownAttribute)
                 if (preCheck and (preCheck.CooldownReady == false or preCheck.EstimatedCooldownReady == false))
-                    or (stampMid ~= nil and stampMid ~= stampBefore)
-                    or (Hunter.StunCheck and Hunter.StunCheck.IsInGodhumanZ(LocalPlayer.Character)) then
+                    or (stampMid ~= nil and stampMid ~= stampBefore) then
                     casted = true
                     break
                 end
@@ -10421,10 +10549,6 @@ local function castSkillTap(key, holdDuration, count, countInterval, weaponName,
                 local acknowledgementDeadline = os.clock() + 0.09
                 repeat
                     if castTool.Parent ~= LocalPlayer.Character or Hunter.TargetPlayer ~= targetPlayer then break end
-                    if Hunter.StunCheck and Hunter.StunCheck.IsInGodhumanZ(LocalPlayer.Character) then
-                        accepted = true
-                        break
-                    end
                     local curChar = LocalPlayer.Character
                     lastCheck = Hunter.ReadSkillState(castTool, keyName)
                     local stampNow = curChar and curChar:GetAttribute(cooldownAttribute)
@@ -10438,9 +10562,6 @@ local function castSkillTap(key, holdDuration, count, countInterval, weaponName,
                 until false
                 if accepted then
                     casted = true
-                    if isGodhumanSkill then
-                        Hunter._godhumanLockUntil = os.clock() + (keyName == "Z" and 0.45 or 0.35)
-                    end
                     Hunter._lastSkillCast = {Tool = castTool.Name, Key = keyName, At = os.clock()}
                     Hunter._lastSkillRejection = nil
                     break
@@ -10466,11 +10587,6 @@ local function castSkillTap(key, holdDuration, count, countInterval, weaponName,
         Hunter._localSkillCooldownUntil = Hunter._localSkillCooldownUntil or {}
         Hunter._localSkillCooldownUntil[tostring(castTool.Name) .. "_" .. tostring(keyName)] = os.clock() + 1.50
         Hunter._lastSkillCast = {Tool = castTool.Name, Key = keyName, At = os.clock()}
-        if isGodhumanSkill then
-            Hunter._godhumanLockUntil = math.max(Hunter._godhumanLockUntil or 0, os.clock() + (keyName == "Z" and 0.45 or 0.35))
-            task.wait(0.06)
-            waitUntilSkillAnimationDone(keyName == "Z" and 1.65 or 1.15)
-        end
     end
     unlockSkillState()
     if not ok then
@@ -10570,96 +10686,195 @@ table.insert(Hunter._connections, getgenv()._TrashHub_SpawnCombatConn)
 end
 do
     local ken = Hunter.KenCheck
-    local state = {Stopped = false, LastAttempt = -math.huge, Pressing = false, KeyDown = false, Serial = 0}
+    local state = {Stopped = false, LastAttempt = -math.huge, NextRetryAt = -math.huge,
+        Pressing = false, KeyDown = false, Serial = 0, TimerSerial = 0,
+        AwaitingUntil = 0, Failures = 0, Attempts = 0, Confirmations = 0}
     local connections = {}
+    local stopWatch = function() end
+    local stopAutomation
 
-    local function canEnable(char)
-        if state.Stopped or not Hunter._isRunning or not char or char ~= LocalPlayer.Character or not char.Parent then
-            return false
-        end
+    local function publish(phase, reason, status)
+        Hunter.KenStatus = {Phase = phase, Reason = reason, Attempts = state.Attempts,
+            ConsecutiveFailures = state.Failures, LastAttemptAt = state.LastAttempt,
+            NextRetryAt = state.NextRetryAt, ConfirmedAt = state.ConfirmedAt,
+            Active = status and status.Active, HasV1 = status and status.HasV1,
+            HasV2 = status and status.HasV2, KenDisabled = status and status.KenDisabled,
+            LastError = state.LastError}
+    end
+
+    local function readStatus(char)
+        if state.Stopped or not Hunter._isRunning then return nil, "stopped" end
+        if not char or char ~= LocalPlayer.Character or not char.Parent then return nil, "no-character" end
         local hum = char:FindFirstChildOfClass("Humanoid")
-        if not hum or hum.Health <= 0 then return false end
+        if not hum or hum.Health <= 0 then return nil, "character-not-alive" end
+        if LocalPlayer:GetAttribute("LoadComplete") == false then return nil, "game-loading" end
         local ok, status = pcall(ken.GetStatus, LocalPlayer)
-        return ok and status.Valid == true and status.Character == char
-            and (status.HasV1 == true or status.HasV2 == true)
-            and status.Active == false and status.KenDisabled == false
-    end
-    local function releaseKey()
-        if state.KeyDown then
-            state.KeyDown = false
-            pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game) end)
+        if not ok then state.LastError = tostring(status); return nil, "ken-read-error" end
+        if type(status) ~= "table" or status.Valid ~= true or status.Character ~= char then
+            return nil, "ken-data-pending"
         end
+        return status
     end
+
+    local function eligible(char)
+        local status, reason = readStatus(char)
+        if not status then return false, reason end
+        if status.Active == true then return false, "active", status end
+        if status.KenDisabled == true then return false, "ken-broken", status end
+        if not (status.HasV1 == true or status.HasV2 == true) then return false, "ken-ownership-pending", status end
+        if UserInputService and type(UserInputService.GetFocusedTextBox) == "function" then
+            local ok, focused = pcall(UserInputService.GetFocusedTextBox, UserInputService)
+            if ok and focused then return false, "text-input-focused", status end
+        end
+        return true, "inactive", status
+    end
+
+    local function releaseKey()
+        if not state.KeyDown then return true end
+        local ok, message = pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+        end)
+        if ok then state.KeyDown = false else state.LastError = tostring(message) end
+        return ok
+    end
+
     local function cancelPress()
-        releaseKey()
         state.Serial += 1
         state.Pressing = false
+        state.AwaitingUntil, state.AwaitingCharacter = 0, nil
+        releaseKey()
+    end
+
+    local function unconfirmed(reason)
+        state.Failures += 1
+        state.AwaitingUntil, state.AwaitingCharacter = 0, nil
+        state.NextRetryAt = math.max(state.NextRetryAt,
+            state.LastAttempt + math.min(1.2 * 2 ^ math.min(state.Failures - 1, 2), 4))
+        publish("retrying", reason)
     end
 
     local function triggerEnableObservation(char)
         char = char or LocalPlayer.Character
-        if not canEnable(char) or state.Pressing or tick() - state.LastAttempt < 1.2 then return end
+        local allowed, reason, status = eligible(char)
+        if reason == "active" then
+            if state.AwaitingCharacter == char then
+                state.Confirmations += 1
+                state.ConfirmedAt = tick()
+            end
+            state.AwaitingUntil, state.AwaitingCharacter = 0, nil
+            state.Failures = 0
+            publish("active", "KenActive-confirmed", status)
+            return false
+        end
+        if not allowed then publish("waiting", reason, status); return false end
+        if state.Pressing then return false end
+        if state.KeyDown and not releaseKey() then
+            publish("input-error", "key-release-failed", status)
+            return false
+        end
+        local now = tick()
+        if state.AwaitingCharacter == char and state.AwaitingUntil > 0 then
+            if now < state.AwaitingUntil then
+                publish("confirming", "waiting-KenActive", status)
+                return false
+            end
+            unconfirmed("activation-not-confirmed")
+        end
+        if now < state.NextRetryAt or now - state.LastAttempt < 1.2 then return false end
         state.Pressing = true
         state.Serial += 1
         local serial = state.Serial
         task.spawn(function()
+            local attempted = false
             local ok, pressError = pcall(function()
-                if serial ~= state.Serial or not canEnable(char) then return end
-                state.LastAttempt = tick()
-                state.KeyDown = true
+                if serial ~= state.Serial then return end
+                local stillAllowed = eligible(char)
+                if not stillAllowed then return end
+                state.LastAttempt, state.NextRetryAt = tick(), tick() + 1.2
+                state.Attempts += 1
+                state.AwaitingUntil, state.AwaitingCharacter = tick() + 0.8, char
+                state.KeyDown, attempted = true, true
+                publish("confirming", "E-sent-awaiting-KenActive", status)
                 VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
                 task.wait(0.05)
             end)
-            if serial == state.Serial then
-                releaseKey()
-                state.Pressing = false
-            end
-            if not ok and not state.Stopped then
-                warn("[TrashHub][KEN_INPUT_ERROR] " .. tostring(pressError))
+            if serial ~= state.Serial then return end
+            local released = releaseKey()
+            state.Pressing = false
+            if not ok then
+                state.LastError = tostring(pressError)
+                if attempted then unconfirmed("key-input-error") end
+                if not state.Stopped then warn("[TrashHub][KEN_INPUT_ERROR] " .. tostring(pressError)) end
+            elseif not released then
+                publish("input-error", "key-release-failed")
             end
         end)
+        return true
     end
 
     local function onCharacterAdded(char)
         cancelPress()
-        state.LastAttempt = -math.huge
+        state.LastAttempt, state.NextRetryAt, state.Failures = -math.huge, -math.huge, 0
+        local serial = state.Serial
         task.delay(0.6, function()
-            if LocalPlayer.Character == char then triggerEnableObservation(char) end
+            if serial == state.Serial and LocalPlayer.Character == char then triggerEnableObservation(char) end
         end)
     end
-    local stopWatch = ken.WatchTarget(LocalPlayer, function(status, eventType)
+
+    stopWatch = ken.WatchTarget(LocalPlayer, function(status, eventType)
         if state.Stopped or not Hunter._isRunning then return end
         if status.Active then
-            state.LastAttempt = tick()
-        elseif eventType == "KenActiveChanged" or eventType == "KenBreakRecovered" then
+            triggerEnableObservation(status.Character)
+        elseif eventType == "KenActiveChanged" or eventType == "KenBreakRecovered" or eventType == "DodgesLeftChanged" then
             local char = status.Character
             if not char or char ~= LocalPlayer.Character then return end
+            local serial = state.Serial
             task.delay(eventType == "KenBreakRecovered" and 0.1 or 0.2, function()
-                if char == LocalPlayer.Character then triggerEnableObservation(char) end
+                if serial == state.Serial and char == LocalPlayer.Character then triggerEnableObservation(char) end
             end)
         end
     end)
     connections[#connections + 1] = LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
-    connections[#connections + 1] = LocalPlayer.CharacterRemoving:Connect(function()
-        cancelPress()
+    connections[#connections + 1] = LocalPlayer.CharacterRemoving:Connect(function(char)
+        if char == LocalPlayer.Character then cancelPress() end
     end)
+
+    stopAutomation = function()
+        if state.Stopped then return end
+        state.Stopped = true
+        state.TimerSerial += 1
+        if state.TimerThread and type(task.cancel) == "function" then pcall(task.cancel, state.TimerThread) end
+        state.TimerThread = nil
+        cancelPress()
+        stopWatch()
+        for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+        table.clear(connections)
+        if Hunter.TriggerEnableObservation == triggerEnableObservation then Hunter.TriggerEnableObservation = nil end
+        publish("stopped", "automation-stopped")
+    end
+
+    local function schedulePoll(delay)
+        if state.Stopped then return end
+        local timerSerial = state.TimerSerial
+        state.TimerThread = task.delay(delay, function()
+            state.TimerThread = nil
+            if state.Stopped or timerSerial ~= state.TimerSerial then return end
+            if not Hunter._isRunning then stopAutomation(); return end
+            local ok, message = pcall(triggerEnableObservation, LocalPlayer.Character)
+            if not ok then state.LastError = tostring(message); publish("error", "maintenance-error") end
+            schedulePoll(0.25)
+        end)
+    end
 
     Hunter.TriggerEnableObservation = triggerEnableObservation
     Hunter.ObservationHaki = {
         GetStatus = function() return ken.GetStatus(LocalPlayer) end,
-        Stop = function()
-            if state.Stopped then return end
-            state.Stopped = true
-            cancelPress()
-            stopWatch()
-            for _, connection in ipairs(connections) do
-                pcall(function() connection:Disconnect() end)
-            end
-            table.clear(connections)
-            if Hunter.TriggerEnableObservation == triggerEnableObservation then Hunter.TriggerEnableObservation = nil end
-        end,
+        GetDiagnostics = function() return table.clone(Hunter.KenStatus or {}) end,
+        Step = triggerEnableObservation,
+        Stop = stopAutomation,
     }
     if LocalPlayer.Character then onCharacterAdded(LocalPlayer.Character) end
+    schedulePoll(0.6)
 end
 
 do
@@ -11125,7 +11340,7 @@ local function runSkillsOnlyLoop()
                         task.wait(targetInPortal and 0.02 or 0.08)
                     elseif isLocked then
                         Hunter._isPreparingSkillCast = false
-                        Hunter._combatPhase = "LOCKED:" .. tostring(lockReason or "StunOrGodhumanZ")
+                        Hunter._combatPhase = "LOCKED:" .. tostring(lockReason or "Stun")
                         if not (Hunter.StunCheck and Hunter.StunCheck.IsInGodhumanZ(myChar)) then
                             activateRaceV3()
                         end
@@ -14316,6 +14531,7 @@ end
 
 function Hunter.Destroy()
     Hunter._isRunning = false
+    if Hunter.FastSkill then pcall(Hunter.FastSkill.Destroy) end
     if Hunter.Noclip then pcall(Hunter.Noclip.Destroy, Hunter.Noclip) end
     if Hunter.PortalRuntime then pcall(Hunter.PortalRuntime.Destroy) end
     if Hunter._cancelHop then pcall(Hunter._cancelHop) end
