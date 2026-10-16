@@ -813,19 +813,10 @@ end
         local gameSettings = userSettings and userSettings:GetService("UserGameSettings")
         if gameSettings then gameSettings.PerformanceStatsVisible = false end
     end)
-local _cachedChar = nil
-local _cachedHum = nil
-local _cachedRoot = nil
-
 local function getCharacter()
     local char = LocalPlayer and LocalPlayer.Character
-    if char ~= _cachedChar or not _cachedHum or _cachedHum.Parent ~= char or not _cachedRoot or _cachedRoot.Parent ~= char then
-        _cachedChar = char
-        _cachedHum = char and char:FindFirstChildOfClass("Humanoid")
-        _cachedRoot = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
-    end
-    local hum = _cachedHum
-    local root = _cachedRoot
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
     if hum and hum.Sit and not (Hunter and Hunter.StunCheck and Hunter.StunCheck.IsRealStun and Hunter.StunCheck.IsRealStun(char)) then
         hum.Sit = false
         pcall(function()
@@ -6903,12 +6894,26 @@ local _lowHpSkyCFrame = nil
 local _lowHpLastHopAttempt = -math.huge
 local _lowHpListenerGeneration = 0
 
+-- Resolve the live Humanoid on every read; no UI text or cached Humanoid.
+local function readLowHealthCharacter()
+    local character = LocalPlayer and LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart)
+    if humanoid and humanoid.Parent ~= character then humanoid = nil end
+    if root and root.Parent ~= character then root = nil end
+    return character, humanoid, root
+end
+
 local function lowHpStatus(phase, reason)
     local old = Hunter.LowHealthStatus
     if not old or old.Phase ~= phase or old.Reason ~= reason then
         Hunter.LowHealthStatus = {Phase = phase, Reason = reason, Since = os.clock(), Active = Hunter._isHealingInSky == true}
         print("[TrashHub][LOW_HEALTH] Phase=" .. phase .. " Reason=" .. tostring(reason or ""))
     end
+    local _, humanoid = readLowHealthCharacter()
+    Hunter.LowHealthStatus.Health = humanoid and humanoid.Health
+    Hunter.LowHealthStatus.HealthSource = "Humanoid.Health"
+    Hunter.LowHealthStatus.Threshold = LOW_HP_ESCAPE_CFG.TriggerHealth
 end
 local function stopLowHealthCombat()
     local heldKey = Hunter._skillHeldKey
@@ -6932,20 +6937,27 @@ local function releaseLowHealthEscape(reason)
     _lowHpLastHopAttempt = -math.huge
     lowHpStatus("idle", reason)
 end
-local function handleLowHealthEscape(root, hum)
-    if not Hunter._isRunning or isHopping or Hunter._isHealingInSky then return false end
-    local character, liveHum, liveRoot = getCharacter()
+local function handleLowHealthEscape(root, hum, observedHealth)
+    if not Hunter._isRunning or Hunter._isHealingInSky then return false end
+    local character, liveHum, liveRoot = readLowHealthCharacter()
     if not character or character ~= LocalPlayer.Character then return false end
+    if hum ~= liveHum then observedHealth = nil end
     hum, root = liveHum, liveRoot
-    if not hum or hum.Parent ~= character or hum.Health <= 0 or hum.Health > LOW_HP_ESCAPE_CFG.TriggerHealth then return false end
+    if not hum or hum.Parent ~= character or hum.Health <= 0 then return false end
+    local health = hum.Health
+    if type(observedHealth) == "number" and observedHealth > 0 and observedHealth < math.huge then
+        health = math.min(health, observedHealth)
+    end
+    if health > LOW_HP_ESCAPE_CFG.TriggerHealth then return false end
     Hunter._isHealingInSky = true
     _lowHpEscapeCharacter, _lowHpEscapeRoot = character, root
     _lowHpSkyCFrame = nil
     _lowHpSkyStarted = false
     _lowHpLastHopAttempt = -math.huge
-    Hunter.LowHealthTelemetry = {Health = hum.Health, DetectedAt = os.clock()}
+    Hunter.LowHealthTelemetry = {Health = health, CurrentHealth = hum.Health, Source = "Humanoid.Health",
+        DetectedAt = os.clock(), DuringHop = isHopping == true}
     stopLowHealthCombat()
-    if Hunter.PortalRuntime then Hunter.PortalRuntime.Cancel("low-health") end
+    if Hunter.PortalRuntime then pcall(Hunter.PortalRuntime.Cancel, "low-health") end
     pcall(function()
         Hunter.TargetSuspended = true
         Hunter.TargetPart = nil
@@ -6959,16 +6971,21 @@ local function handleLowHealthEscape(root, hum)
     if LOW_HP_ESCAPE_CFG.TryLift then LOW_HP_ESCAPE_CFG.TryLift() end
     return true
 end
-local function checkLowHealthEscape()
+local function checkLowHealthEscape(observedHumanoid, observedHealth)
     if not Hunter._isRunning then return false end
-    local character, hum = getCharacter()
+    local character, hum = readLowHealthCharacter()
     if _lowHpEscapeCharacter and character ~= _lowHpEscapeCharacter then releaseLowHealthEscape("character-changed") end
     if hum and hum.Health <= 0 then
         if Hunter._isHealingInSky then releaseLowHealthEscape("character-died") end
         return false
     end
-    if not Hunter._isHealingInSky and hum and hum.Health > 0 and hum.Health <= LOW_HP_ESCAPE_CFG.TriggerHealth then
-        handleLowHealthEscape(nil, hum)
+    local health = hum and hum.Health
+    if hum and observedHumanoid == hum and type(observedHealth) == "number"
+        and observedHealth > 0 and observedHealth < math.huge then
+        health = math.min(health, observedHealth)
+    end
+    if not Hunter._isHealingInSky and health and health > 0 and health <= LOW_HP_ESCAPE_CFG.TriggerHealth then
+        handleLowHealthEscape(nil, hum, health)
     end
     if Hunter._isHealingInSky then
         Hunter.TargetSuspended = true
@@ -6980,18 +6997,34 @@ local function checkLowHealthEscape()
 end
 
 LOW_HP_ESCAPE_CFG.TryLift = function()
-    if not Hunter._isRunning or not Hunter._isHealingInSky or isHopping then return false end
-    local character, hum, root = getCharacter()
-    if not root or not hum or hum.Health <= 0 or root.Parent ~= character then return false end
+    if not Hunter._isRunning or not Hunter._isHealingInSky then return false end
+    local character, hum, root = readLowHealthCharacter()
+    if not root or not hum or hum.Health <= 0 or root.Parent ~= character then
+        lowHpStatus("waiting-character", "root-or-humanoid-unavailable")
+        return false
+    end
     if root ~= _lowHpEscapeRoot then _lowHpEscapeRoot, _lowHpSkyStarted, _lowHpSkyCFrame = root, false, nil end
     if _lowHpSkyStarted then return true end
     local guard = Hunter.LowHealthGuard
     if guard then guard:Start(character, root, hum); guard:Step(character, root) end
-    if isLocalPlayerInPortalDimension() or _isPortalWarping then return false end
+    if isLocalPlayerInPortalDimension() then
+        lowHpStatus("waiting-dimension-exit", "combat-paused-in-portal-v")
+        return false
+    end
+    if _isPortalWarping then
+        lowHpStatus("waiting-portal", "finishing-current-portal-action")
+        return false
+    end
     local clientLocksBlocked = guard and guard.Active and guard.HookStatus == "installed" and guard.PositionHookStatus == "installed"
-    if root.Anchored or (not clientLocksBlocked and Hunter.StunCheck and Hunter.StunCheck.IsServerPhysicsLocked(character)) then return false end
+    if root.Anchored or (not clientLocksBlocked and Hunter.StunCheck and Hunter.StunCheck.IsServerPhysicsLocked(character)) then
+        lowHpStatus("waiting-stun", root.Anchored and "root-anchored" or "physics-locked")
+        return false
+    end
     local route = Hunter.GhostShipRoute
-    if route and (route:IsInside(root.Position) or route:DeferLowHealth()) then return false end
+    if route and (route:IsInside(root.Position) or route:DeferLowHealth()) then
+        lowHpStatus("waiting-room-exit", "room-route-must-finish")
+        return false
+    end
     if route and route.Busy then route:Reset("sky-retreat") end
     setHover(true)
     if guard then guard:ArmPositionProtection() end
@@ -7026,7 +7059,7 @@ end
 
 local function stepLowHealthEscape(dt)
     if not checkLowHealthEscape() then return false end
-    local character, hum, root = getCharacter()
+    local character, hum, root = readLowHealthCharacter()
     if not root or not hum or root.Parent ~= character then lowHpStatus("waiting-character", "root-unavailable"); return true end
     if root ~= _lowHpEscapeRoot then
         _lowHpEscapeRoot, _lowHpSkyStarted, _lowHpSkyCFrame = root, false, nil
@@ -7035,7 +7068,11 @@ local function stepLowHealthEscape(dt)
         Hunter.LowHealthGuard:Start(character, root, hum)
         Hunter.LowHealthGuard:Step(character, root)
     end
-    if isHopping then lowHpStatus("hopping", "teleport-in-progress"); return true end
+    if isHopping then
+        if root.Anchored then lowHpStatus("waiting-stun", "root-anchored")
+        elseif _lowHpSkyStarted then lowHpStatus("hopping", "retreat-owned-by-hop-worker") end
+        return true
+    end
     if isLocalPlayerInPortalDimension() then
         if Hunter.LowHealthGuard then Hunter.LowHealthGuard:DisarmPositionProtection() end
         setHover(true)
@@ -7090,7 +7127,14 @@ local function stepLowHealthEscape(dt)
     end
     return true
 end
-Hunter.LowHealthEscape = {Check = checkLowHealthEscape, Step = stepLowHealthEscape, Stop = releaseLowHealthEscape, ContinueClimb = LOW_HP_ESCAPE_CFG.Climb}
+Hunter.LowHealthEscape = {Check = checkLowHealthEscape, Step = stepLowHealthEscape, Stop = releaseLowHealthEscape,
+    ContinueClimb = LOW_HP_ESCAPE_CFG.Climb,
+    GetHealth = function()
+        local character, humanoid = readLowHealthCharacter()
+        return {Source = "Humanoid.Health", Health = humanoid and humanoid.Health,
+            Threshold = LOW_HP_ESCAPE_CFG.TriggerHealth, CharacterPresent = character ~= nil,
+            HumanoidPresent = humanoid ~= nil, RetreatActive = Hunter._isHealingInSky == true}
+    end}
 
 if getgenv()._TrashHub_LowHpHeartbeat then
     pcall(function() getgenv()._TrashHub_LowHpHeartbeat:Disconnect() end)
@@ -7134,12 +7178,12 @@ local function setupLowHealthEscapeListener(character)
             end
             healthConnection, healthPropertyConnection, boundHum = nil, nil, hum
             if hum then
-                healthConnection = hum.HealthChanged:Connect(function()
-                    if current() then checkLowHealthEscape() end
+                healthConnection = hum.HealthChanged:Connect(function(health)
+                    if current() and hum == boundHum then checkLowHealthEscape(hum, health) end
                 end)
                 connections[#connections + 1] = healthConnection
                 healthPropertyConnection = hum:GetPropertyChangedSignal("Health"):Connect(function()
-                    if current() and hum == boundHum then checkLowHealthEscape() end
+                    if current() and hum == boundHum then checkLowHealthEscape(hum, hum.Health) end
                 end)
                 connections[#connections + 1] = healthPropertyConnection
             end
@@ -9689,7 +9733,7 @@ autoHopServer = function(reason)
                 Hunter.GhostShipRoute:Reset("server-hop")
             end
             pcall(function()
-                if instantRetreatHop or Hunter.GhostShipRoute:IsInside(myRoot.Position) then return end
+                if instantRetreatHop or Hunter._isHealingInSky or Hunter.GhostShipRoute:IsInside(myRoot.Position) then return end
                 local curCF = myRoot.CFrame
                 local curPos = curCF.Position
                 myRoot.CFrame = CFrame.new(curPos.X, curPos.Y + 250, curPos.Z) * (curCF - curPos)
@@ -9716,6 +9760,10 @@ autoHopServer = function(reason)
                     return
                 end
                 if instantRetreatHop then
+                    Hunter.LowHealthEscape.ContinueClimb(dt, root)
+                    return
+                end
+                if Hunter._isHealingInSky then
                     Hunter.LowHealthEscape.ContinueClimb(dt, root)
                     return
                 end
